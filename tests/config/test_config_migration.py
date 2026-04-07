@@ -3,6 +3,7 @@ import socket
 from unittest.mock import patch
 
 from nanobot.config.loader import load_config, save_config
+from nanobot.health.storage import HealthWorkspace
 from nanobot.security.network import validate_url_target
 
 
@@ -62,6 +63,204 @@ def test_save_config_writes_context_window_tokens_but_not_memory_window(tmp_path
     assert defaults["maxTokens"] == 2222
     assert defaults["contextWindowTokens"] == 65_536
     assert "memoryWindow" not in defaults
+
+
+def test_load_config_resolves_env_placeholders(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "minimax": {
+                        "apiKey": "ENV:MINIMAX_API_KEY",
+                    }
+                },
+                "channels": {
+                    "telegram": {
+                        "enabled": True,
+                        "token": "ENV:TELEGRAM_BOT_TOKEN",
+                        "allowFrom": ["*"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-test-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-test-token")
+
+    config = load_config(config_path)
+
+    assert config.providers.minimax.api_key == "minimax-test-key"
+    assert config.channels.telegram["token"] == "telegram-test-token"
+
+
+def test_save_config_preserves_env_placeholders(tmp_path, monkeypatch) -> None:
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "minimax": {
+                        "apiKey": "ENV:MINIMAX_API_KEY",
+                    }
+                },
+                "channels": {
+                    "telegram": {
+                        "enabled": True,
+                        "token": "ENV:TELEGRAM_BOT_TOKEN",
+                        "allowFrom": ["*"],
+                    }
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MINIMAX_API_KEY", "minimax-live-key")
+    monkeypatch.setenv("TELEGRAM_BOT_TOKEN", "telegram-live-token")
+
+    config = load_config(config_path)
+    save_config(config, config_path)
+    saved = json.loads(config_path.read_text(encoding="utf-8"))
+
+    assert saved["providers"]["minimax"]["apiKey"] == "ENV:MINIMAX_API_KEY"
+    assert saved["channels"]["telegram"]["token"] == "ENV:TELEGRAM_BOT_TOKEN"
+
+
+def test_load_config_applies_active_hosted_health_overrides(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "workspace": str(workspace),
+                        "provider": "minimax",
+                        "model": "MiniMax-M2.7",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HEALTH_VAULT_KEY", "test-health-vault-key")
+    health = HealthWorkspace(workspace)
+    health.create_setup_session()
+    health.store_provider_secret(
+        provider_name="minimax",
+        model="MiniMax-M2.7",
+        api_key="minimax-live-key",
+        secret="test-health-vault-key",
+    )
+    health.store_telegram_secret(
+        bot_token="123:abc",
+        bot_id=123,
+        bot_username="healthbot_test",
+        secret="test-health-vault-key",
+    )
+    health.store_profile_draft(
+        submission={
+            "phase1": {
+                "full_name": "Jane Doe",
+                "email": "jane@example.com",
+                "phone": "+15550001111",
+                "timezone": "Asia/Colombo",
+                "language": "en",
+                "preferred_channel": "telegram",
+                "age_range": "35-44",
+                "sex": "female",
+                "gender": "woman",
+                "wake_time": "06:30",
+                "sleep_time": "22:30",
+                "consents": ["privacy"],
+            },
+            "phase2": {
+                "mood_interest": 0,
+                "mood_down": 0,
+                "activity_level": "moderate",
+                "nutrition_quality": "mixed",
+                "sleep_quality": "fair",
+                "stress_level": "moderate",
+            },
+        },
+        secret="test-health-vault-key",
+    )
+    health.mark_setup_active()
+
+    config = load_config(config_path)
+
+    assert config.providers.minimax.api_key == "minimax-live-key"
+    assert config.channels.telegram["enabled"] is True
+    assert config.channels.telegram["token"] == "123:abc"
+
+
+def test_load_config_applies_active_hosted_openrouter_overrides(tmp_path, monkeypatch) -> None:
+    workspace = tmp_path / "workspace"
+    config_path = tmp_path / "config.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "agents": {
+                    "defaults": {
+                        "workspace": str(workspace),
+                        "provider": "minimax",
+                        "model": "MiniMax-M2.7",
+                    }
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("HEALTH_VAULT_KEY", "test-health-vault-key")
+    health = HealthWorkspace(workspace)
+    health.create_setup_session()
+    health.store_provider_secret(
+        provider_name="openrouter",
+        model="openai/gpt-4o-mini",
+        api_key="sk-or-live-key",
+        secret="test-health-vault-key",
+    )
+    health.store_telegram_secret(
+        bot_token="123:abc",
+        bot_id=123,
+        bot_username="healthbot_test",
+        secret="test-health-vault-key",
+    )
+    health.store_profile_draft(
+        submission={
+            "phase1": {
+                "full_name": "Jane Doe",
+                "email": "jane@example.com",
+                "phone": "+15550001111",
+                "timezone": "Asia/Colombo",
+                "language": "en",
+                "preferred_channel": "telegram",
+                "age_range": "35-44",
+                "sex": "female",
+                "gender": "woman",
+                "wake_time": "06:30",
+                "sleep_time": "22:30",
+                "consents": ["privacy"],
+            },
+            "phase2": {
+                "mood_interest": 0,
+                "mood_down": 0,
+                "activity_level": "moderate",
+                "nutrition_quality": "mixed",
+                "sleep_quality": "fair",
+                "stress_level": "moderate",
+            },
+        },
+        secret="test-health-vault-key",
+    )
+    health.mark_setup_active()
+
+    config = load_config(config_path)
+
+    assert config.agents.defaults.provider == "openrouter"
+    assert config.agents.defaults.model == "openai/gpt-4o-mini"
+    assert config.providers.openrouter.api_key == "sk-or-live-key"
 
 
 def test_onboard_does_not_crash_with_legacy_memory_window(tmp_path, monkeypatch) -> None:

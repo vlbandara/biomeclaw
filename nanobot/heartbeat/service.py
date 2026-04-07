@@ -142,6 +142,10 @@ class HeartbeatService:
             except Exception as e:
                 logger.error("Heartbeat error: {}", e)
 
+    async def tick_once(self) -> None:
+        """Run one heartbeat decision + optional execute/notify cycle (for multi-tenant)."""
+        await self._tick()
+
     async def _tick(self) -> None:
         """Execute a single heartbeat tick."""
         from nanobot.utils.evaluator import evaluate_response

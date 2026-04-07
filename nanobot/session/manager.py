@@ -202,6 +202,17 @@ class SessionManager:
 
         self._cache[session.key] = session
 
+    def compact_session_file(self, session: Session) -> None:
+        """Remove consolidated message prefix from the in-memory session and persist (smaller JSONL)."""
+        if session.last_consolidated <= 0:
+            return
+        if len(session.messages) <= session.last_consolidated:
+            return
+        session.messages = session.messages[session.last_consolidated:]
+        session.last_consolidated = 0
+        session.updated_at = datetime.now()
+        self.save(session)
+
     def invalidate(self, key: str) -> None:
         """Remove a session from the in-memory cache."""
         self._cache.pop(key, None)

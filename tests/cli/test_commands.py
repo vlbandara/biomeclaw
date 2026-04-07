@@ -503,7 +503,7 @@ def test_agent_config_sets_active_path(monkeypatch, tmp_path: Path) -> None:
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
-    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda *a, **k: object())
     monkeypatch.setattr("nanobot.cron.service.CronService", lambda _store: object())
 
     class _FakeAgentLoop:
@@ -538,7 +538,7 @@ def test_agent_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: Pa
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
-    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda *a, **k: object())
 
     class _FakeCron:
         def __init__(self, store_path: Path) -> None:
@@ -584,7 +584,7 @@ def test_agent_workspace_override_does_not_migrate_legacy_cron(
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
-    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda *a, **k: object())
     monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
 
     class _FakeCron:
@@ -637,7 +637,7 @@ def test_agent_custom_config_workspace_does_not_migrate_legacy_cron(
     monkeypatch.setattr("nanobot.config.loader.load_config", lambda _path=None: config)
     monkeypatch.setattr("nanobot.cli.commands.sync_workspace_templates", lambda _path: None)
     monkeypatch.setattr("nanobot.cli.commands._make_provider", lambda _config: object())
-    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda: object())
+    monkeypatch.setattr("nanobot.bus.queue.MessageBus", lambda *a, **k: object())
     monkeypatch.setattr("nanobot.config.paths.get_cron_dir", lambda: legacy_dir)
 
     class _FakeCron:
@@ -790,7 +790,7 @@ def _patch_serve_runtime(monkeypatch, config: Config, seen: dict[str, object]) -
     _patch_cli_command_runtime(
         monkeypatch,
         config,
-        message_bus=lambda: object(),
+        message_bus=lambda *a, **k: object(),
         session_manager=lambda _workspace: object(),
     )
     monkeypatch.setattr("nanobot.agent.loop.AgentLoop", _FakeAgentLoop)
@@ -857,7 +857,7 @@ def test_gateway_uses_workspace_directory_for_cron_store(monkeypatch, tmp_path: 
     _patch_cli_command_runtime(
         monkeypatch,
         config,
-        message_bus=lambda: object(),
+        message_bus=lambda *a, **k: object(),
         session_manager=lambda _workspace: object(),
         cron_service=_StopCron,
     )
@@ -889,7 +889,7 @@ def test_gateway_workspace_override_does_not_migrate_legacy_cron(
     _patch_cli_command_runtime(
         monkeypatch,
         config,
-        message_bus=lambda: object(),
+        message_bus=lambda *a, **k: object(),
         session_manager=lambda _workspace: object(),
         cron_service=_StopCron,
         get_cron_dir=lambda: legacy_dir,
@@ -928,7 +928,7 @@ def test_gateway_custom_config_workspace_does_not_migrate_legacy_cron(
     _patch_cli_command_runtime(
         monkeypatch,
         config,
-        message_bus=lambda: object(),
+        message_bus=lambda *a, **k: object(),
         session_manager=lambda _workspace: object(),
         cron_service=_StopCron,
         get_cron_dir=lambda: legacy_dir,

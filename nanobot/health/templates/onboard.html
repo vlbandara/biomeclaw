@@ -1,0 +1,105 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Health Onboarding</title>
+    <link rel="stylesheet" href="/static/onboard.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card">
+        <header>
+          <p class="eyebrow">health assistant</p>
+          <h1>Let’s get you set up</h1>
+          <p class="lede">This takes about 2 minutes. When you’re done, you’ll go straight back to {{ invite_meta.channel|title }}.</p>
+        </header>
+
+        {% if channel_links %}
+        <section class="handoff">
+          <p class="handoff-title">Need to return to your chat?</p>
+          <div class="handoff-actions">
+            {% if invite_meta.channel == "telegram" and channel_links.telegram %}
+            <a class="channel-link" href="{{ channel_links.telegram }}" target="_blank" rel="noopener">Back to Telegram</a>
+            {% endif %}
+            {% if invite_meta.channel == "whatsapp" and channel_links.whatsapp %}
+            <a class="channel-link secondary-link" href="{{ channel_links.whatsapp }}" target="_blank" rel="noopener">Back to WhatsApp</a>
+            {% endif %}
+          </div>
+        </section>
+        {% endif %}
+
+        <form
+          id="onboard-form"
+          data-invite="{{ invite }}"
+          data-bound-channel="{{ invite_meta.channel }}"
+          data-telegram-url="{{ channel_links.telegram or '' }}"
+          data-whatsapp-url="{{ channel_links.whatsapp or '' }}"
+        >
+          <section class="step active" data-step="1">
+            <h2>Step 1 of 2</h2>
+            <label>Full name <input name="full_name" required /></label>
+            <label>Email <input name="email" type="email" /></label>
+            <label>Phone <input name="phone" /></label>
+            <label>Timezone <input name="timezone" value="UTC" required /></label>
+            <label>Language <input name="language" value="en" required /></label>
+            <label>Preferred channel
+              <select name="preferred_channel">
+                <option value="telegram">Telegram</option>
+                <option value="whatsapp">WhatsApp</option>
+              </select>
+            </label>
+            <label>Age range <input name="age_range" placeholder="35-44" required /></label>
+            <label>Sex <input name="sex" placeholder="female / male / intersex / prefer not to say" required /></label>
+            <label>Gender <input name="gender" placeholder="woman / man / non-binary / prefer not to say" required /></label>
+            <label>Height (cm) <input name="height_cm" type="number" step="0.1" /></label>
+            <label>Weight (kg) <input name="weight_kg" type="number" step="0.1" /></label>
+            <label>Known conditions <textarea name="known_conditions" placeholder="One per line"></textarea></label>
+            <label>Medications <textarea name="medications" placeholder="One per line"></textarea></label>
+            <label>Allergies <textarea name="allergies" placeholder="One per line"></textarea></label>
+            <div class="row">
+              <label>Wake time <input name="wake_time" type="time" value="07:00" required /></label>
+              <label>Sleep time <input name="sleep_time" type="time" value="22:30" required /></label>
+            </div>
+            <fieldset>
+              <legend>Consent acknowledgements</legend>
+              <label><input type="checkbox" name="consents" value="privacy" checked /> I understand raw identifiers stay in an encrypted local vault.</label>
+              <label><input type="checkbox" name="consents" value="emergency" checked /> I understand emergencies will be redirected to local urgent help.</label>
+              <label><input type="checkbox" name="consents" value="coaching" checked /> I want reminders and non-diagnostic coaching.</label>
+            </fieldset>
+          </section>
+
+          <section class="step" data-step="2">
+            <h2>Step 2 of 2</h2>
+            <label>Little interest or pleasure in doing things (0-3) <input name="mood_interest" type="number" min="0" max="3" value="0" required /></label>
+            <label>Feeling down, depressed, or hopeless (0-3) <input name="mood_down" type="number" min="0" max="3" value="0" required /></label>
+            <label>Activity level <input name="activity_level" placeholder="low / moderate / high" required /></label>
+            <label>Nutrition quality <input name="nutrition_quality" placeholder="irregular / mixed / balanced" required /></label>
+            <label>Sleep quality <input name="sleep_quality" placeholder="poor / fair / good" required /></label>
+            <label>Stress level <input name="stress_level" placeholder="low / moderate / high" required /></label>
+            <label>Goals <textarea name="goals" placeholder="One per line"></textarea></label>
+            <label>Current concerns <textarea name="current_concerns"></textarea></label>
+            <label>Reminder preferences <textarea name="reminder_preferences" placeholder="One per line"></textarea></label>
+            <label>Medication reminder windows <textarea name="medication_reminder_windows" placeholder="08:00&#10;20:00"></textarea></label>
+            <label><input name="morning_check_in" type="checkbox" checked /> Enable morning check-ins</label>
+            <label><input name="weekly_summary" type="checkbox" checked /> Enable weekly summary</label>
+          </section>
+
+          <footer class="actions">
+            <button type="button" id="back" class="secondary">Back</button>
+            <button type="button" id="next">Continue</button>
+            <button type="submit" id="submit">Finish setup</button>
+          </footer>
+        </form>
+
+        <p id="status" class="status"></p>
+        <section id="completion" class="completion" hidden>
+          <h2>You’re all set</h2>
+          <p>Your assistant is ready. Go back to your chat and send a message.</p>
+          <div id="completion-actions" class="handoff-actions"></div>
+        </section>
+      </section>
+    </main>
+    <script src="/static/onboard.js"></script>
+  </body>
+</html>

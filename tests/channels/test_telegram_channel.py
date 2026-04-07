@@ -188,6 +188,7 @@ async def test_start_creates_separate_pools_with_proxy(monkeypatch) -> None:
     assert builder.get_updates_request_value is poll_req
     assert callable(app.updater.start_polling_kwargs["error_callback"])
     assert any(cmd.command == "status" for cmd in app.bot.commands)
+    assert any(cmd.command == "onboard" for cmd in app.bot.commands)
     assert any(cmd.command == "dream" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_log" for cmd in app.bot.commands)
     assert any(cmd.command == "dream_restore" for cmd in app.bot.commands)
@@ -221,6 +222,55 @@ async def test_start_respects_custom_pool_config(monkeypatch) -> None:
     assert api_req.kwargs["connection_pool_size"] == 32
     assert api_req.kwargs["pool_timeout"] == 10.0
     assert poll_req.kwargs["pool_timeout"] == 10.0
+
+
+@pytest.mark.asyncio
+async def test_on_start_health_mode_replies_with_onboarding_button(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NANOBOT_HEALTH_MODE", "1")
+    monkeypatch.setenv("HEALTH_ONBOARDING_BASE_URL", "https://health.example.com")
+
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel.workspace = tmp_path
+
+    update = _make_telegram_update(chat_type="private", text="/start")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_start(update, None)
+
+    update.message.reply_text.assert_awaited_once()
+    call = update.message.reply_text.await_args
+    body = call.args[0] if call.args else call.kwargs.get("text", "")
+    assert "health assistant" in body
+    button = call.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.url.startswith("https://health.example.com/onboard/")
+
+
+@pytest.mark.asyncio
+async def test_on_start_health_mode_prefers_setup_button(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("NANOBOT_HEALTH_MODE", "1")
+    monkeypatch.setenv("HEALTH_ONBOARDING_BASE_URL", "https://health.example.com")
+
+    from nanobot.health.storage import HealthWorkspace
+
+    HealthWorkspace(tmp_path).create_setup_session()
+    channel = TelegramChannel(
+        TelegramConfig(enabled=True, token="123:abc", allow_from=["*"]),
+        MessageBus(),
+    )
+    channel.workspace = tmp_path
+
+    update = _make_telegram_update(chat_type="private", text="/start")
+    update.message.reply_text = AsyncMock()
+
+    await channel._on_start(update, None)
+
+    call = update.message.reply_text.await_args
+    button = call.kwargs["reply_markup"].inline_keyboard[0][0]
+    assert button.text == "Start setup"
+    assert button.url.startswith("https://health.example.com/setup/")
 
 
 @pytest.mark.asyncio

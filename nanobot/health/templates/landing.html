@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>NanoHealth</title>
+    <link rel="stylesheet" href="/static/onboard.css" />
+    <link rel="stylesheet" href="/static/landing.css" />
+  </head>
+  <body>
+    <main class="shell">
+      <section class="card landing-card">
+        <header class="landing-hero">
+          <p class="eyebrow">nanohealth</p>
+          <h1>Your personal health coach. Always on.</h1>
+          <p class="lede">
+            A real-feeling, interesting coach that pushes you to train, keeps you honest about habits, and stays present at 2am.
+            Built on NanoBot, customized for you in minutes.
+          </p>
+        </header>
+
+        <section class="landing-grid">
+          <div class="landing-panel">
+            <h2>How it works</h2>
+            <ol class="how-list">
+              <li><strong>Start</strong>: tell us your name + timezone.</li>
+              <li><strong>Connect Telegram</strong>: paste your BotFather token (we validate it).</li>
+              <li><strong>Activate</strong>: we spin up your private coach and send you to chat.</li>
+            </ol>
+          </div>
+
+          <div class="landing-panel">
+            <h2>Get started</h2>
+            <p class="step-copy">You’ll have your own bot running in a few minutes.</p>
+
+            <form id="signup-form" class="signup">
+              <label>What should we call you?
+                <input name="name" placeholder="Vinod" required />
+              </label>
+              <label>Your timezone
+                <input name="timezone" placeholder="UTC" value="UTC" required />
+              </label>
+              <button type="submit">Create my coach</button>
+            </form>
+            <p id="signup-status" class="status"></p>
+
+            <p class="fineprint">
+              By continuing you agree this is coaching, not medical advice. Emergencies are always redirected to local urgent help.
+            </p>
+          </div>
+        </section>
+      </section>
+    </main>
+
+    <script>
+      const form = document.getElementById("signup-form");
+      const statusNode = document.getElementById("signup-status");
+      function setStatus(message, isError = false) {
+        statusNode.textContent = message;
+        statusNode.classList.toggle("status-error", isError);
+      }
+      async function fetchJson(url, options = {}) {
+        const response = await fetch(url, options);
+        const data = await response.json().catch(() => ({}));
+        if (!response.ok) {
+          throw new Error(data.detail || "Request failed.");
+        }
+        return data;
+      }
+      form.addEventListener("submit", async (event) => {
+        event.preventDefault();
+        try {
+          const name = form.querySelector('[name="name"]').value.trim();
+          const timezone = form.querySelector('[name="timezone"]').value.trim() || "UTC";
+          setStatus("Creating your setup link…");
+          const data = await fetchJson("/api/signup", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ name, timezone }),
+          });
+          if (!data.setupToken) {
+            throw new Error("Missing setup token.");
+          }
+          window.location.href = `/setup/${encodeURIComponent(data.setupToken)}`;
+        } catch (error) {
+          setStatus(error.message || "Unable to start onboarding.", true);
+        }
+      });
+    </script>
+  </body>
+</html>
+

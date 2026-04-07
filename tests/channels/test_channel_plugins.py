@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -176,6 +177,7 @@ async def test_manager_loads_plugin_from_dict_config():
             "fakeplugin": {"enabled": True, "allowFrom": ["*"]},
         }),
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+        workspace_path=Path("/tmp/fake-nanobot-ws"),
     )
 
     with patch(
@@ -279,6 +281,7 @@ async def test_manager_skips_disabled_plugin():
             "fakeplugin": {"enabled": False},
         }),
         providers=SimpleNamespace(groq=SimpleNamespace(api_key="")),
+        workspace_path=Path("/tmp/fake-nanobot-ws"),
     )
 
     with patch(
