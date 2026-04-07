@@ -20,16 +20,23 @@ services:
   orchestrator:
     <<: *common-config
     container_name: nanohealth-orchestrator
+    user: "0:0"
+    cap_add:
+      - SYS_ADMIN
+      - DAC_OVERRIDE
     entrypoint: ["python", "-m", "uvicorn"]
     command: ["nanobot.health.api:create_app", "--factory", "--host", "0.0.0.0", "--port", "8080"]
     volumes:
+      - ~/.nanobot:/home/nanobot/.nanobot
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       HEALTH_VAULT_KEY: ${HEALTH_VAULT_KEY:-}
       HEALTH_ONBOARDING_BASE_URL: ${HEALTH_ONBOARDING_BASE_URL:-}
       NANOBOT_WORKSPACE: /home/nanobot/.nanobot/workspace
-      NANOBOT_HEALTH_INSTANCE_IMAGE: ${NANOBOT_HEALTH_INSTANCE_IMAGE:-nanobot-ai:latest}
+      NANOBOT_HEALTH_INSTANCE_IMAGE: ${NANOBOT_HEALTH_INSTANCE_IMAGE:-nanobot-orchestrator:latest}
+    ports:
+      - "8080:8080"
     restart: unless-stopped
     healthcheck:
       test: ["CMD-SHELL", "curl -sf http://127.0.0.1:8080/healthz || exit 1"]

@@ -22,20 +22,34 @@
           data-whatsapp-url="{{ channel_links.whatsapp or '' }}"
         >
           <section class="step active" data-step="1">
-            <h2>About you</h2>
-            <p class="step-copy">This helps your coach feel personal, not generic.</p>
-            <label>Full name <input name="full_name" required /></label>
-            <label>Timezone <input name="timezone" value="UTC" required /></label>
-            <label>Age range <input name="age_range" placeholder="25-34" required /></label>
-          </section>
-
-          <section class="step" data-step="2">
             <h2>Connect Telegram</h2>
-            <p class="step-copy">Create a bot in BotFather, then paste the token here.</p>
+            <p class="step-copy">We’ll create your Telegram bot in BotFather, then paste the token here.</p>
             <div class="channel-grid">
               <section class="channel-card">
                 <h3>Telegram bot</h3>
-                <p>Paste the bot token from BotFather.</p>
+                <p class="helper">
+                  New to this? Follow the mini guide below — it’s the same flow everyone uses.
+                </p>
+
+                <details class="coach-guide" open>
+                  <summary class="coach-guide__summary">BotFather guide (2 minutes)</summary>
+                  <ol class="coach-guide__steps">
+                    <li>
+                      Open Telegram and go to
+                      <a href="https://t.me/BotFather" target="_blank" rel="noopener">@BotFather</a>.
+                      <button type="button" class="coach-guide__button" id="open-botfather">Open BotFather</button>
+                    </li>
+                    <li>Tap <strong>Start</strong>, then send <code>/newbot</code>.</li>
+                    <li>Pick a name for your coach (anything you like).</li>
+                    <li>Pick a username ending in <code>bot</code> (example: <code>mycoach_bot</code>).</li>
+                    <li>BotFather will send a token like <code>123456:ABC-DEF...</code>. Copy it.</li>
+                  </ol>
+                  <p class="coach-guide__fineprint helper">
+                    <strong>What’s a bot token?</strong> It’s a secret password that lets your coach bot run.
+                    Don’t share it publicly. If it leaks, you can regenerate it in BotFather with <code>/token</code>.
+                  </p>
+                </details>
+
                 <label>Bot token <input name="telegram_bot_token" autocomplete="off" /></label>
                 <button type="button" id="connect-telegram">Connect Telegram</button>
                 <p id="telegram-summary" class="helper"></p>
@@ -43,41 +57,16 @@
             </div>
           </section>
 
-          <section class="step" data-step="3">
-            <h2>Your goals</h2>
-            <p class="step-copy">Quick context so your coach can push you in the right direction.</p>
-            <label>Language <input name="language" value="en" required /></label>
+          <section class="step" data-step="2">
+            <h2>Optional (30 seconds)</h2>
+            <p class="step-copy">This just tunes the vibe. You can skip and do it in chat later.</p>
             <input type="hidden" name="preferred_channel" value="telegram" />
-            <label>Sex <input name="sex" placeholder="female / male / intersex / prefer not to say" required /></label>
-            <label>Gender <input name="gender" placeholder="woman / man / non-binary / prefer not to say" required /></label>
-            <label>Known conditions <textarea name="known_conditions" placeholder="One per line"></textarea></label>
-            <label>Medications <textarea name="medications" placeholder="One per line"></textarea></label>
-            <label>Allergies <textarea name="allergies" placeholder="One per line"></textarea></label>
-            <div class="row">
-              <label>Wake time <input name="wake_time" type="time" value="07:00" required /></label>
-              <label>Sleep time <input name="sleep_time" type="time" value="22:30" required /></label>
-            </div>
-            <fieldset>
-              <legend>Consent acknowledgements</legend>
-              <label><input type="checkbox" name="consents" value="privacy" checked /> I understand personal identifiers stay in an encrypted local vault.</label>
-              <label><input type="checkbox" name="consents" value="emergency" checked /> I understand emergencies will be redirected to urgent local help.</label>
-              <label><input type="checkbox" name="consents" value="coaching" checked /> I want reminders and non-diagnostic coaching.</label>
-            </fieldset>
-            <label>Little interest or pleasure in doing things (0-3) <input name="mood_interest" type="number" min="0" max="3" value="0" required /></label>
-            <label>Feeling down, depressed, or hopeless (0-3) <input name="mood_down" type="number" min="0" max="3" value="0" required /></label>
-            <label>Activity level <input name="activity_level" placeholder="low / moderate / high" required /></label>
-            <label>Nutrition quality <input name="nutrition_quality" placeholder="irregular / mixed / balanced" required /></label>
-            <label>Sleep quality <input name="sleep_quality" placeholder="poor / fair / good" required /></label>
-            <label>Stress level <input name="stress_level" placeholder="low / moderate / high" required /></label>
-            <label>Goals <textarea name="goals" placeholder="One per line"></textarea></label>
-            <label>Current concerns <textarea name="current_concerns"></textarea></label>
-            <label>Reminder preferences <textarea name="reminder_preferences" placeholder="One per line"></textarea></label>
-            <label>Medication reminder windows <textarea name="medication_reminder_windows" placeholder="08:00&#10;20:00"></textarea></label>
-            <label><input name="morning_check_in" type="checkbox" checked /> Enable morning check-ins</label>
-            <label><input name="weekly_summary" type="checkbox" checked /> Enable weekly summary</label>
+            <label>What do you want help with? <textarea name="goals" placeholder="Gym consistency&#10;Sleep schedule&#10;Cut sugar"></textarea></label>
+            <label><input name="morning_check_in" type="checkbox" checked /> Morning check-ins</label>
+            <label><input name="weekly_summary" type="checkbox" checked /> Weekly summary</label>
           </section>
 
-          <section class="step" data-step="4">
+          <section class="step" data-step="3">
             <h2>Finish</h2>
             <p class="step-copy">We’ll switch everything on and send you back to chat.</p>
             <div class="summary-card">

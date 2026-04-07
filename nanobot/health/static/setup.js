@@ -9,6 +9,7 @@ const completionActions = document.getElementById("completion-actions");
 const telegramSummary = document.getElementById("telegram-summary");
 const finishSummary = document.getElementById("finish-summary");
 const connectTelegramButton = document.getElementById("connect-telegram");
+const openBotFatherButton = document.getElementById("open-botfather");
 
 let currentStep = 0;
 let setupState = null;
@@ -18,6 +19,28 @@ function parseLines(value) {
     .split("\n")
     .map((item) => item.trim())
     .filter(Boolean);
+}
+
+function normalizeTelegramBotToken(value) {
+  return String(value || "")
+    .trim()
+    .replace(/\s+/g, "");
+}
+
+function validateTelegramBotTokenFormat(value) {
+  const token = normalizeTelegramBotToken(value);
+  if (!token) {
+    throw new Error("Paste your Telegram bot token first.");
+  }
+  // Typical token format: 123456789:AAAbbbCCCdddEEEfffGGGhhhIIIjjj
+  // Keep it permissive enough for Telegram, strict enough to catch copy mistakes.
+  const looksRight = /^\d{5,}:[A-Za-z0-9_-]{20,}$/.test(token);
+  if (!looksRight) {
+    throw new Error(
+      "That token doesn’t look right. It should look like “123456:ABC-DEF...” (numbers, colon, then letters).",
+    );
+  }
+  return token;
 }
 
 function updateStep() {
@@ -55,28 +78,20 @@ function setFieldValue(name, value) {
 }
 
 function fillProfile(profile) {
-  if (!profile || !profile.phase1) {
+  // Minimal onboarding: we only keep a few optional fields in the wizard.
+  if (!profile) {
     return;
   }
-  Object.entries(profile.phase1).forEach(([name, value]) => {
-    if (name === "consents") {
-      form.querySelectorAll('input[name="consents"]').forEach((checkbox) => {
-        checkbox.checked = (value || []).includes(checkbox.value);
-      });
-      return;
-    }
-    setFieldValue(name, value);
-  });
-  Object.entries(profile.phase2 || {}).forEach(([name, value]) => {
-    if (name === "morning_check_in" || name === "weekly_summary") {
-      const checkbox = field(name);
-      if (checkbox) {
-        checkbox.checked = Boolean(value);
-      }
-      return;
-    }
-    setFieldValue(name, value);
-  });
+  const phase2 = (profile.phase2 || {});
+  if (typeof phase2.morning_check_in === "boolean") {
+    setFieldValue("morning_check_in", phase2.morning_check_in);
+  }
+  if (typeof phase2.weekly_summary === "boolean") {
+    setFieldValue("weekly_summary", phase2.weekly_summary);
+  }
+  if (Array.isArray(phase2.goals)) {
+    setFieldValue("goals", phase2.goals);
+  }
 }
 
 function renderCompletion(links) {
@@ -98,52 +113,15 @@ function renderCompletion(links) {
 }
 
 function profilePayload() {
-  const checkboxGroups = new Map();
-  form.querySelectorAll("[name]").forEach((element) => {
-    if (element.type !== "checkbox") {
-      return;
-    }
-    if (!checkboxGroups.has(element.name)) {
-      checkboxGroups.set(element.name, []);
-    }
-    if (element.checked) {
-      checkboxGroups.get(element.name).push(element.value);
-    }
-  });
-
   return {
     phase1: {
-      full_name: field("full_name").value,
-      email: field("email").value,
-      phone: field("phone").value,
-      timezone: field("timezone").value,
-      language: field("language").value,
-      preferred_channel: field("preferred_channel").value,
-      age_range: field("age_range").value,
-      sex: field("sex").value,
-      gender: field("gender").value,
-      height_cm: field("height_cm").value ? Number(field("height_cm").value) : null,
-      weight_kg: field("weight_kg").value ? Number(field("weight_kg").value) : null,
-      known_conditions: parseLines(field("known_conditions").value),
-      medications: parseLines(field("medications").value),
-      allergies: parseLines(field("allergies").value),
-      wake_time: field("wake_time").value,
-      sleep_time: field("sleep_time").value,
-      consents: checkboxGroups.get("consents") || [],
+      // Server will fill sensible defaults if missing.
+      preferred_channel: (field("preferred_channel")?.value || "telegram"),
     },
     phase2: {
-      mood_interest: Number(field("mood_interest").value || 0),
-      mood_down: Number(field("mood_down").value || 0),
-      activity_level: field("activity_level").value,
-      nutrition_quality: field("nutrition_quality").value,
-      sleep_quality: field("sleep_quality").value,
-      stress_level: field("stress_level").value,
-      goals: parseLines(field("goals").value),
-      current_concerns: field("current_concerns").value,
-      reminder_preferences: parseLines(field("reminder_preferences").value),
-      medication_reminder_windows: parseLines(field("medication_reminder_windows").value),
-      morning_check_in: field("morning_check_in").checked,
-      weekly_summary: field("weekly_summary").checked,
+      goals: parseLines(field("goals")?.value || ""),
+      morning_check_in: Boolean(field("morning_check_in")?.checked),
+      weekly_summary: Boolean(field("weekly_summary")?.checked),
     },
   };
 }
@@ -152,7 +130,18 @@ async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
-    throw new Error(data.detail || "Request failed.");
+    const detail = data.detail;
+    if (Array.isArray(detail)) {
+      const message = detail
+        .map((item) => {
+          const path = Array.isArray(item.loc) ? item.loc.join(".") : "";
+          const msg = item.msg || "Invalid value";
+          return path ? `${path}: ${msg}` : msg;
+        })
+        .join("; ");
+      throw new Error(message || "Request failed.");
+    }
+    throw new Error(detail || "Request failed.");
   }
   return data;
 }
@@ -171,8 +160,8 @@ async function refreshStatus() {
 
   fillProfile(setupState.profile);
   finishSummary.textContent = setupState.activationReady
-    ? "Everything looks ready. Turn on your assistant when you’re ready."
-    : "You can activate once Telegram is connected and your profile is saved.";
+    ? "Everything looks ready. Turn on your coach when you’re ready."
+    : "You can activate once Telegram is connected.";
 
   if (setupState.state === "active") {
     renderCompletion(setupState.channelLinks || {});
@@ -180,10 +169,8 @@ async function refreshStatus() {
 }
 
 async function saveTelegram() {
-  const botToken = field("telegram_bot_token").value.trim();
-  if (!botToken) {
-    throw new Error("Paste your Telegram bot token first.");
-  }
+  const botToken = validateTelegramBotTokenFormat(field("telegram_bot_token").value);
+  setFieldValue("telegram_bot_token", botToken);
   const token = form.dataset.setupToken;
   setStatus("Checking your Telegram bot token…");
   await fetchJson(`/api/setup/${token}/channels/telegram`, {
@@ -197,14 +184,14 @@ async function saveTelegram() {
 
 async function saveProfile() {
   const token = form.dataset.setupToken;
-  setStatus("Saving your profile…");
+  setStatus("Saving…");
   await fetchJson(`/api/setup/${token}/profile`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(profilePayload()),
   });
   await refreshStatus();
-  setStatus("Your profile is saved.");
+  setStatus("Saved.");
 }
 
 async function activateSetup() {
@@ -220,11 +207,6 @@ async function activateSetup() {
 async function handleNext() {
   try {
     if (currentStep === 0) {
-      currentStep += 1;
-      updateStep();
-      return;
-    }
-    if (currentStep === 1) {
       const hasTelegramToken = field("telegram_bot_token").value.trim();
       if (hasTelegramToken && !((setupState?.channels || {}).telegram || {}).connected) {
         await saveTelegram();
@@ -238,7 +220,7 @@ async function handleNext() {
       updateStep();
       return;
     }
-    if (currentStep === 2) {
+    if (currentStep === 1) {
       await saveProfile();
       currentStep += 1;
       updateStep();
@@ -255,6 +237,12 @@ connectTelegramButton.addEventListener("click", async () => {
     setStatus(error.message || "Unable to connect Telegram.", true);
   }
 });
+
+if (openBotFatherButton) {
+  openBotFatherButton.addEventListener("click", () => {
+    window.open("https://t.me/BotFather", "_blank", "noopener");
+  });
+}
 
 nextButton.addEventListener("click", handleNext);
 backButton.addEventListener("click", () => {

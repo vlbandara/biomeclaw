@@ -35,32 +35,33 @@ class SignupSubmission(BaseModel):
 
 
 class Phase1Submission(BaseModel):
-    full_name: str
+    # Minimal onboarding: most fields are optional; the service will backfill defaults.
+    full_name: str = ""
     email: str = ""
     phone: str = ""
-    timezone: str
-    language: str
-    preferred_channel: str
-    age_range: str
-    sex: str
-    gender: str
+    timezone: str = "UTC"
+    language: str = "en"
+    preferred_channel: str = "telegram"
+    age_range: str = "not set"
+    sex: str = "not set"
+    gender: str = "not set"
     height_cm: float | None = None
     weight_kg: float | None = None
     known_conditions: list[str] = Field(default_factory=list)
     medications: list[str] = Field(default_factory=list)
     allergies: list[str] = Field(default_factory=list)
-    wake_time: str
-    sleep_time: str
+    wake_time: str = ""
+    sleep_time: str = ""
     consents: list[str] = Field(default_factory=list)
 
 
 class Phase2Submission(BaseModel):
-    mood_interest: int = Field(ge=0, le=3)
-    mood_down: int = Field(ge=0, le=3)
-    activity_level: str
-    nutrition_quality: str
-    sleep_quality: str
-    stress_level: str
+    mood_interest: int = Field(default=0, ge=0, le=3)
+    mood_down: int = Field(default=0, ge=0, le=3)
+    activity_level: str = "not set"
+    nutrition_quality: str = "not set"
+    sleep_quality: str = "not set"
+    stress_level: str = "not set"
     goals: list[str] = Field(default_factory=list)
     current_concerns: str = ""
     reminder_preferences: list[str] = Field(default_factory=list)
@@ -72,6 +73,34 @@ class Phase2Submission(BaseModel):
 class OnboardingSubmission(BaseModel):
     phase1: Phase1Submission
     phase2: Phase2Submission
+
+
+def _default_onboarding_submission(*, setup_payload: dict[str, Any]) -> dict[str, Any]:
+    """Build a minimal onboarding submission so activation can proceed without a long intake."""
+    preferred_channel = "telegram"
+    timezone = "UTC"
+    language = "en"
+    try:
+        timezone = str((setup_payload.get("profile") or {}).get("phase1", {}).get("timezone") or timezone)
+        language = str((setup_payload.get("profile") or {}).get("phase1", {}).get("language") or language)
+        preferred_channel = str((setup_payload.get("profile") or {}).get("phase1", {}).get("preferred_channel") or preferred_channel)
+    except Exception:
+        pass
+    return OnboardingSubmission(
+        phase1=Phase1Submission(
+            preferred_channel=preferred_channel,
+            timezone=timezone,
+            language=language,
+            consents=["privacy", "emergency", "coaching"],
+        ),
+        phase2=Phase2Submission(
+            mood_interest=0,
+            mood_down=0,
+            goals=[],
+            morning_check_in=True,
+            weekly_summary=True,
+        ),
+    ).model_dump()
 
 
 class ProviderSetupSubmission(BaseModel):
@@ -86,6 +115,11 @@ class TelegramSetupSubmission(BaseModel):
 def _resolve_workspace() -> Path:
     raw = os.environ.get("NANOBOT_WORKSPACE") or "~/.nanobot/workspace"
     return Path(raw).expanduser().resolve()
+
+
+def _load_health_instance_config_template() -> dict[str, Any]:
+    path = Path(__file__).with_name("config_template.json")
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _channel_links() -> dict[str, str]:
@@ -177,7 +211,7 @@ def _setup_status_payload(
         "activationReady": bool(
             provider.get("validated_at")
             and any(bool(item.get("connected")) for item in channels.values() if isinstance(item, dict))
-            and setup.get("profile", {}).get("submitted_at")
+                # Minimal onboarding: profile is optional; activation only requires a connected channel.
         ),
     }
 
@@ -382,7 +416,15 @@ def create_app() -> FastAPI:
             raise HTTPException(status_code=400, detail="Connect Telegram first.")
         submission = health.load_profile_draft_submission(secret=app.state.health_secret)
         if not submission:
-            raise HTTPException(status_code=400, detail="Tell us about you before activation.")
+            submission = _default_onboarding_submission(setup_payload=payload)
+
+        telegram_token = (
+            health.load_setup_secrets(secret=app.state.health_secret)
+            .get("telegram", {})
+            .get("bot_token")
+        )
+        if not telegram_token:
+            raise HTTPException(status_code=400, detail="Paste your Telegram bot token first.")
 
         profile = persist_health_onboarding(
             workspace,
@@ -391,12 +433,56 @@ def create_app() -> FastAPI:
             secret=app.state.health_secret,
         )
 
-        telegram_token = health.load_setup_secrets(secret=app.state.health_secret).get("telegram", {}).get("bot_token")
         if payload["channels"].get("telegram", {}).get("connected") and telegram_token:
             try:
                 await register_telegram_commands(telegram_token)
             except Exception:
                 pass
+
+        # Spawn the per-user coach container.
+        config_json = _load_health_instance_config_template()
+        try:
+            config_json.setdefault("agents", {}).setdefault("defaults", {})["timezone"] = profile.get(
+                "timezone", "UTC"
+            )
+        except Exception:
+            pass
+        minimax_api_key = os.environ.get("MINIMAX_API_KEY", "").strip()
+        spawn = None
+        warnings: list[str] = []
+        if not minimax_api_key:
+            warnings.append("MINIMAX_API_KEY is not set; the coach may not be able to reply.")
+        try:
+            spawn = app.state.spawner.spawn_instance(
+                user_id=setup_token,
+                config_json=config_json,
+                onboarding_submission=submission,
+                extra_env={
+                    "MINIMAX_API_KEY": minimax_api_key,
+                    "TELEGRAM_BOT_TOKEN": telegram_token,
+                    "HEALTH_VAULT_KEY": os.environ.get("HEALTH_VAULT_KEY", "").strip()
+                    or app.state.health_secret,
+                },
+            )
+        except Exception as exc:
+            import traceback
+            traceback.print_exc()
+            warnings.append(f"Unable to spawn coach container: {exc}")
+        if not spawn:
+            raise HTTPException(
+                status_code=502,
+                detail="Unable to start your coach: " + "; ".join(warnings) if warnings else "Container spawn failed.",
+            )
+
+        try:
+            await app.state.registry.set_container(
+                user_id=setup_token,
+                container_id=spawn.container_id,
+                workspace_volume=spawn.volume_name,
+                status="active",
+            )
+        except Exception:
+            pass
 
         health.mark_setup_active()
         links = _current_channel_links(
@@ -410,6 +496,8 @@ def create_app() -> FastAPI:
                 "state": "active",
                 "preferredChannel": profile["preferred_channel"],
                 "channelLinks": links,
+                "containerId": spawn.container_id,
+                "warnings": warnings,
             }
         )
 

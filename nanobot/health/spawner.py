@@ -70,6 +70,16 @@ class HealthInstanceSpawner:
             return docker.DockerClient(base_url=self.docker_base_url)
         return docker.from_env()
 
+    def _ensure_image(self, image: str) -> None:
+        """Ensure docker image exists locally (pull if missing)."""
+        client = self._client()
+        try:
+            client.images.get(image)
+            return
+        except Exception:
+            # Pull latest for that tag if not present.
+            client.images.pull(image)
+
     def _volume_name(self, user_id: str) -> str:
         prefix = _env("NANOBOT_HEALTH_INSTANCE_VOLUME_PREFIX", "nanohealth")
         safe = "".join(ch for ch in user_id if ch.isalnum() or ch in {"-", "_"}).strip("_-")
@@ -103,6 +113,7 @@ class HealthInstanceSpawner:
         client = self._client()
         mountpoint = self._volume_mountpoint()
         archive = _tar_from_dir(workspace_dir)
+        self._ensure_image("alpine:3.20")
         helper = client.containers.create(
             image="alpine:3.20",
             command=["sh", "-lc", "sleep 30"],
@@ -111,8 +122,9 @@ class HealthInstanceSpawner:
         try:
             helper.start()
             # Ensure directories exist before extraction.
-            helper.exec_run(["sh", "-lc", f"mkdir -p {mountpoint}/workspace"], privileged=False)
+            helper.exec_run(["sh", "-lc", f"mkdir -p {mountpoint}/workspace"])
             ok = helper.put_archive(f"{mountpoint}/workspace", archive)
+            helper.exec_run(["sh", "-lc", f"chown -R 1000:1000 {mountpoint}"])
             if not ok:  # pragma: no cover
                 raise RuntimeError("Failed to copy workspace archive into docker volume.")
         finally:
@@ -129,14 +141,25 @@ class HealthInstanceSpawner:
         env: dict[str, str],
     ) -> str:
         client = self._client()
+        self._ensure_image(self.image)
         name = self._container_name(user_id)
         mountpoint = self._volume_mountpoint()
         workspace_path = self._workspace_in_container()
 
+        # Idempotency for retries: if a container with the same name exists, replace it.
+        try:
+            existing = client.containers.get(name)
+            try:
+                existing.remove(force=True)
+            except Exception:
+                pass
+        except Exception:
+            pass
+
         container = client.containers.run(
             self.image,
             name=name,
-            command=["nanobot", "gateway"],
+            command=["gateway", "--config", "/data/workspace/config.json"],
             detach=True,
             restart_policy=self._restart_policy(),
             mem_limit=self._memory_limit(),
