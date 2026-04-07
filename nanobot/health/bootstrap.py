@@ -64,6 +64,7 @@ def write_health_workspace_assets(workspace: Path, profile: dict[str, Any]) -> N
     ensure_dir(workspace / "memory")
     ensure_dir(workspace / "skills" / "health")
     ensure_dir(workspace / "skills" / "health-checkin")
+    ensure_dir(workspace / "skills" / "habits")
 
     demographics = profile.get("demographics", {})
     routines = profile.get("routines", {})
@@ -118,6 +119,7 @@ def write_health_workspace_assets(workspace: Path, profile: dict[str, Any]) -> N
         workspace / "skills" / "health-checkin" / "SKILL.md": render_template(
             "health/skills/health-checkin/SKILL.md"
         ),
+        workspace / "skills" / "habits" / "SKILL.md": render_template("health/skills/habits/SKILL.md"),
     }
 
     for path, content in files.items():
