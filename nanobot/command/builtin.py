@@ -298,6 +298,31 @@ async def cmd_help(ctx: CommandContext) -> OutboundMessage:
     )
 
 
+async def cmd_onboard(ctx: CommandContext) -> OutboundMessage:
+    """Create a one-time health onboarding invite."""
+    from nanobot.health.storage import HealthWorkspace
+
+    if ctx.msg.channel not in {"telegram", "whatsapp"}:
+        return OutboundMessage(
+            channel=ctx.msg.channel,
+            chat_id=ctx.msg.chat_id,
+            content="`/onboard` is currently supported for Telegram and WhatsApp only.",
+            metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+        )
+
+    health = HealthWorkspace(ctx.loop.workspace)
+    token, _ = health.get_or_create_invite(channel=ctx.msg.channel, chat_id=ctx.msg.chat_id)
+    return OutboundMessage(
+        channel=ctx.msg.channel,
+        chat_id=ctx.msg.chat_id,
+        content=(
+            "Open this one-time onboarding link on your phone:\n\n"
+            f"{health.onboarding_url(token)}"
+        ),
+        metadata={**dict(ctx.msg.metadata or {}), "render_as": "text"},
+    )
+
+
 def build_help_text() -> str:
     """Build canonical help text shared across channels."""
     lines = [
@@ -306,6 +331,7 @@ def build_help_text() -> str:
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/onboard — Create a health onboarding link",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -321,6 +347,7 @@ def register_builtin_commands(router: CommandRouter) -> None:
     router.priority("/status", cmd_status)
     router.exact("/new", cmd_new)
     router.exact("/status", cmd_status)
+    router.exact("/onboard", cmd_onboard)
     router.exact("/dream", cmd_dream)
     router.exact("/dream-log", cmd_dream_log)
     router.prefix("/dream-log ", cmd_dream_log)

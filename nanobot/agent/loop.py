@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import re
 import os
 import time
 from contextlib import AsyncExitStack, nullcontext
@@ -16,11 +15,12 @@ from loguru import logger
 from nanobot.agent.context import ContextBuilder
 from nanobot.agent.hook import AgentHook, AgentHookContext, CompositeHook
 from nanobot.agent.memory import Consolidator, Dream
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
+from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
-from nanobot.agent.skills import BUILTIN_SKILLS_DIR
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
+from nanobot.agent.tools.health_onboarding import CompleteOnboardingTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
@@ -28,12 +28,16 @@ from nanobot.agent.tools.shell import ExecTool
 from nanobot.agent.tools.spawn import SpawnTool
 from nanobot.agent.tools.web import WebFetchTool, WebSearchTool
 from nanobot.bus.events import InboundMessage, OutboundMessage
-from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.bus.queue import MessageBus
+from nanobot.command import CommandContext, CommandRouter, register_builtin_commands
 from nanobot.config.schema import AgentDefaults
+from nanobot.health.bootstrap import read_tenant_user_token
+from nanobot.health.safety import emergency_response, is_emergency_language
+from nanobot.health.storage import HealthWorkspace, health_distribution_enabled, is_health_workspace
 from nanobot.providers.base import LLMProvider
 from nanobot.session.manager import Session, SessionManager
 from nanobot.utils.helpers import image_placeholder_text, truncate_text
+from nanobot.utils.prompt_templates import render_template
 from nanobot.utils.runtime import EMPTY_FINAL_RESPONSE_MESSAGE
 
 if TYPE_CHECKING:
@@ -506,6 +510,11 @@ class AgentLoop:
         self._background_tasks.append(task)
         task.add_done_callback(self._background_tasks.remove)
 
+    async def _post_turn_maintenance(self, session: Session) -> None:
+        """Second-pass consolidation and optional session file compaction."""
+        await self.consolidator.maybe_consolidate_by_tokens(session)
+        self.sessions.compact_session_file(session)
+
     def stop(self) -> None:
         """Stop the agent loop."""
         self._running = False
@@ -545,7 +554,7 @@ class AgentLoop:
             self._save_turn(session, all_msgs, 1 + len(history))
             self._clear_runtime_checkpoint(session)
             self.sessions.save(session)
-            self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
+            self._schedule_background(self._post_turn_maintenance(session))
             return OutboundMessage(channel=channel, chat_id=chat_id,
                                   content=final_content or "Background task completed.")
 
@@ -563,60 +572,127 @@ class AgentLoop:
         if result := await self.commands.dispatch(ctx):
             return result
 
-        await self.consolidator.maybe_consolidate_by_tokens(session)
+        if (
+            health_distribution_enabled(self.workspace)
+            and not is_health_workspace(self.workspace)
+            and msg.channel in {"telegram", "whatsapp"}
+            and not raw.startswith("/")
+        ):
+            health = HealthWorkspace(self.workspace)
+            setup = health.load_setup()
+            if setup and health.validate_setup_token(setup.get("token", "")):
+                url = health.setup_url(setup["token"])
+                message = (
+                    "Before we chat, please finish setting up your health assistant:\n\n"
+                    f"{url}"
+                )
+            else:
+                token, _ = health.get_or_create_invite(channel=msg.channel, chat_id=msg.chat_id)
+                message = (
+                    "Before we chat, please finish the health onboarding form:\n\n"
+                    f"{health.onboarding_url(token)}"
+                )
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=message,
+                metadata={**dict(msg.metadata or {}), "render_as": "text"},
+            )
 
-        self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
-        if message_tool := self.tools.get("message"):
-            if isinstance(message_tool, MessageTool):
-                message_tool.start_turn()
+        if is_health_workspace(self.workspace) and msg.channel in {"telegram", "whatsapp"}:
+            try:
+                HealthWorkspace(self.workspace).bind_chat_session(
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                )
+            except Exception:
+                pass
 
-        history = session.get_history(max_messages=0)
-        initial_messages = self.context.build_messages(
-            history=history,
-            current_message=msg.content,
-            media=msg.media if msg.media else None,
-            channel=msg.channel, chat_id=msg.chat_id,
+        if is_health_workspace(self.workspace) and is_emergency_language(msg.content):
+            return OutboundMessage(
+                channel=msg.channel,
+                chat_id=msg.chat_id,
+                content=emergency_response(),
+                metadata={**dict(msg.metadata or {}), "render_as": "text"},
+            )
+
+        onboarding = (
+            (self.workspace / ".health_chat_onboarding").exists()
+            and msg.channel in {"telegram", "whatsapp"}
         )
+        tools_backup = self.tools
+        if onboarding:
+            self.tools = ToolRegistry()
+            self.tools.register(
+                CompleteOnboardingTool(
+                    self.workspace,
+                    channel=msg.channel,
+                    chat_id=msg.chat_id,
+                    user_token=read_tenant_user_token(self.workspace),
+                )
+            )
+        try:
+            await self.consolidator.maybe_consolidate_by_tokens(session)
 
-        async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+            self._set_tool_context(msg.channel, msg.chat_id, msg.metadata.get("message_id"))
+            if message_tool := self.tools.get("message"):
+                if isinstance(message_tool, MessageTool):
+                    message_tool.start_turn()
+
+            history = session.get_history(max_messages=0)
+            onboarding_prompt = (
+                render_template("health/onboarding_system.md", strip=True) if onboarding else None
+            )
+            initial_messages = self.context.build_messages(
+                history=history,
+                current_message=msg.content,
+                media=msg.media if msg.media else None,
+                channel=msg.channel, chat_id=msg.chat_id,
+                system_prompt=onboarding_prompt,
+            )
+
+            async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:
+                meta = dict(msg.metadata or {})
+                meta["_progress"] = True
+                meta["_tool_hint"] = tool_hint
+                await self.bus.publish_outbound(OutboundMessage(
+                    channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
+                ))
+
+            final_content, _, all_msgs = await self._run_agent_loop(
+                initial_messages,
+                on_progress=on_progress or _bus_progress,
+                on_stream=on_stream,
+                on_stream_end=on_stream_end,
+                session=session,
+                channel=msg.channel, chat_id=msg.chat_id,
+                message_id=msg.metadata.get("message_id"),
+            )
+
+            if final_content is None or not final_content.strip():
+                final_content = EMPTY_FINAL_RESPONSE_MESSAGE
+
+            self._save_turn(session, all_msgs, 1 + len(history))
+            self._clear_runtime_checkpoint(session)
+            self.sessions.save(session)
+            self._schedule_background(self._post_turn_maintenance(session))
+
+            if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
+                return None
+
+            preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
+            logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
+
             meta = dict(msg.metadata or {})
-            meta["_progress"] = True
-            meta["_tool_hint"] = tool_hint
-            await self.bus.publish_outbound(OutboundMessage(
-                channel=msg.channel, chat_id=msg.chat_id, content=content, metadata=meta,
-            ))
-
-        final_content, _, all_msgs = await self._run_agent_loop(
-            initial_messages,
-            on_progress=on_progress or _bus_progress,
-            on_stream=on_stream,
-            on_stream_end=on_stream_end,
-            session=session,
-            channel=msg.channel, chat_id=msg.chat_id,
-            message_id=msg.metadata.get("message_id"),
-        )
-
-        if final_content is None or not final_content.strip():
-            final_content = EMPTY_FINAL_RESPONSE_MESSAGE
-
-        self._save_turn(session, all_msgs, 1 + len(history))
-        self._clear_runtime_checkpoint(session)
-        self.sessions.save(session)
-        self._schedule_background(self.consolidator.maybe_consolidate_by_tokens(session))
-
-        if (mt := self.tools.get("message")) and isinstance(mt, MessageTool) and mt._sent_in_turn:
-            return None
-
-        preview = final_content[:120] + "..." if len(final_content) > 120 else final_content
-        logger.info("Response to {}:{}: {}", msg.channel, msg.sender_id, preview)
-
-        meta = dict(msg.metadata or {})
-        if on_stream is not None:
-            meta["_streamed"] = True
-        return OutboundMessage(
-            channel=msg.channel, chat_id=msg.chat_id, content=final_content,
-            metadata=meta,
-        )
+            if on_stream is not None:
+                meta["_streamed"] = True
+            return OutboundMessage(
+                channel=msg.channel, chat_id=msg.chat_id, content=final_content,
+                metadata=meta,
+            )
+        finally:
+            if onboarding:
+                self.tools = tools_backup
 
     def _sanitize_persisted_blocks(
         self,

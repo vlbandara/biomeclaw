@@ -13,9 +13,22 @@ class MessageBus:
     them and pushes responses to the outbound queue.
     """
 
-    def __init__(self):
-        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue()
-        self.outbound: asyncio.Queue[OutboundMessage] = asyncio.Queue()
+    def __init__(
+        self,
+        outbound: asyncio.Queue[OutboundMessage] | None = None,
+        *,
+        maxsize: int = 0,
+    ):
+        """
+        Args:
+            outbound: Optional shared outbound queue (multi-tenant gateways).
+            maxsize: If > 0, bound inbound (and default outbound) queues for back-pressure.
+        """
+        q_kw = {"maxsize": maxsize} if maxsize and maxsize > 0 else {}
+        self.inbound: asyncio.Queue[InboundMessage] = asyncio.Queue(**q_kw)
+        self.outbound: asyncio.Queue[OutboundMessage] = (
+            outbound if outbound is not None else asyncio.Queue(**q_kw)
+        )
 
     async def publish_inbound(self, msg: InboundMessage) -> None:
         """Publish a message from a channel to the agent."""

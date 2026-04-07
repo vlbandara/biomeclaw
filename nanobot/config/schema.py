@@ -146,6 +146,27 @@ class GatewayConfig(Base):
     host: str = "0.0.0.0"
     port: int = 18790
     heartbeat: HeartbeatConfig = Field(default_factory=HeartbeatConfig)
+    multi_tenant: bool = Field(
+        default=False,
+        validation_alias=AliasChoices("multiTenant", "multi_tenant"),
+    )
+    tenants_dir: str = Field(
+        default="~/.nanobot/tenants",
+        validation_alias=AliasChoices("tenantsDir", "tenants_dir"),
+    )
+    tenant_idle_seconds: int = Field(
+        default=30 * 60,
+        ge=0,
+        validation_alias=AliasChoices("tenantIdleSeconds", "tenant_idle_seconds"),
+    )
+    tenant_rate_limit_per_minute: int = Field(
+        default=10,
+        ge=0,
+        validation_alias=AliasChoices(
+            "tenantRateLimitPerMinute",
+            "tenant_rate_limit_per_minute",
+        ),
+    )
 
 
 class WebSearchConfig(Base):

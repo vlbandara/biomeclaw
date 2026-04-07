@@ -1,14 +1,15 @@
 """CLI commands for nanobot."""
 
 import asyncio
-from contextlib import contextmanager, nullcontext
-
 import os
 import select
 import signal
 import sys
+from contextlib import nullcontext
 from pathlib import Path
 from typing import Any
+
+from nanobot.session.manager import SessionManager
 
 # Force UTF-8 encoding for Windows console
 if sys.platform == "win32":
@@ -386,69 +387,49 @@ def _make_provider(config: Config):
 
     Routing is driven by ``ProviderSpec.backend`` in the registry.
     """
-    from nanobot.providers.base import GenerationSettings
-    from nanobot.providers.registry import find_by_name
+    from nanobot.providers.factory import create_provider
 
-    model = config.agents.defaults.model
-    provider_name = config.get_provider_name(model)
-    p = config.get_provider(model)
-    spec = find_by_name(provider_name) if provider_name else None
-    backend = spec.backend if spec else "openai_compat"
+    try:
+        return create_provider(config, workspace=config.workspace_path)
+    except ValueError as exc:
+        console.print(f"[red]Error: {exc}[/red]")
+        console.print("Set the required provider fields in your nanobot config or environment.")
+        raise typer.Exit(1) from exc
 
-    # --- validation ---
-    if backend == "azure_openai":
-        if not p or not p.api_key or not p.api_base:
-            console.print("[red]Error: Azure OpenAI requires api_key and api_base.[/red]")
-            console.print("Set them in ~/.nanobot/config.json under providers.azure_openai section")
-            console.print("Use the model field to specify the deployment name.")
-            raise typer.Exit(1)
-    elif backend == "openai_compat" and not model.startswith("bedrock/"):
-        needs_key = not (p and p.api_key)
-        exempt = spec and (spec.is_oauth or spec.is_local or spec.is_direct)
-        if needs_key and not exempt:
-            console.print("[red]Error: No API key configured.[/red]")
-            console.print("Set one in ~/.nanobot/config.json under providers section")
-            raise typer.Exit(1)
 
-    # --- instantiation by backend ---
-    if backend == "openai_codex":
-        from nanobot.providers.openai_codex_provider import OpenAICodexProvider
-        provider = OpenAICodexProvider(default_model=model)
-    elif backend == "azure_openai":
-        from nanobot.providers.azure_openai_provider import AzureOpenAIProvider
-        provider = AzureOpenAIProvider(
-            api_key=p.api_key,
-            api_base=p.api_base,
-            default_model=model,
-        )
-    elif backend == "github_copilot":
-        from nanobot.providers.github_copilot_provider import GitHubCopilotProvider
-        provider = GitHubCopilotProvider(default_model=model)
-    elif backend == "anthropic":
-        from nanobot.providers.anthropic_provider import AnthropicProvider
-        provider = AnthropicProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-        )
-    else:
-        from nanobot.providers.openai_compat_provider import OpenAICompatProvider
-        provider = OpenAICompatProvider(
-            api_key=p.api_key if p else None,
-            api_base=config.get_api_base(model),
-            default_model=model,
-            extra_headers=p.extra_headers if p else None,
-            spec=spec,
-        )
+def _pick_routable_heartbeat_target(
+    *,
+    workspace: Path,
+    enabled_channels: set[str],
+    session_manager: SessionManager,
+) -> tuple[str, str]:
+    """Pick the best external delivery target for health heartbeat messages."""
+    from nanobot.health.storage import HealthWorkspace
 
-    defaults = config.agents.defaults
-    provider.generation = GenerationSettings(
-        temperature=defaults.temperature,
-        max_tokens=defaults.max_tokens,
-        reasoning_effort=defaults.reasoning_effort,
-    )
-    return provider
+    health = HealthWorkspace(workspace)
+    profile = health.load_profile() or {}
+    preferred_channel = profile.get("preferred_channel")
+
+    if preferred_channel in enabled_channels:
+        for item in session_manager.list_sessions():
+            key = item.get("key") or ""
+            if ":" not in key:
+                continue
+            channel, chat_id = key.split(":", 1)
+            if channel == preferred_channel and chat_id:
+                return channel, chat_id
+
+    for item in session_manager.list_sessions():
+        key = item.get("key") or ""
+        if ":" not in key:
+            continue
+        channel, chat_id = key.split(":", 1)
+        if channel in {"cli", "system"}:
+            continue
+        if channel in enabled_channels and chat_id:
+            return channel, chat_id
+
+    return "cli", "direct"
 
 
 def _load_runtime_config(config: str | None = None, workspace: str | None = None) -> Config:
@@ -474,6 +455,7 @@ def _load_runtime_config(config: str | None = None, workspace: str | None = None
 def _warn_deprecated_config_keys(config_path: Path | None) -> None:
     """Hint users to remove obsolete keys from their config file."""
     import json
+
     from nanobot.config.loader import get_config_path
 
     path = config_path or get_config_path()
@@ -522,6 +504,7 @@ def serve(
         raise typer.Exit(1)
 
     from loguru import logger
+
     from nanobot.agent.loop import AgentLoop
     from nanobot.api.server import create_app
     from nanobot.bus.queue import MessageBus
@@ -617,8 +600,155 @@ def gateway(
 
     console.print(f"{__logo__} Starting nanobot gateway version {__version__} on port {port}...")
     sync_workspace_templates(config.workspace_path)
-    bus = MessageBus()
     provider = _make_provider(config)
+
+    hb_cfg = config.gateway.heartbeat
+    dream_cfg = config.agents.defaults.dream
+    from nanobot.cron.types import CronPayload
+
+    if config.gateway.multi_tenant:
+        from nanobot.bus.events import OutboundMessage
+        from nanobot.tenant import TenantManager, TenantRouter
+
+        tenants_dir = Path(config.gateway.tenants_dir).expanduser()
+        tenants_dir.mkdir(parents=True, exist_ok=True)
+        shared_outbound: asyncio.Queue = asyncio.Queue(maxsize=100)
+        shared_bus = MessageBus(outbound=shared_outbound, maxsize=100)
+        tenant_manager = TenantManager(
+            base_dir=tenants_dir,
+            config=config,
+            provider=provider,
+            shared_outbound=shared_outbound,
+            idle_seconds=config.gateway.tenant_idle_seconds,
+        )
+        router = TenantRouter(
+            shared_bus,
+            tenant_manager,
+            rate_limit_per_minute=config.gateway.tenant_rate_limit_per_minute,
+        )
+        channels = ChannelManager(config, shared_bus)
+        cron_store_path = tenants_dir / "_global" / "cron" / "jobs.json"
+        cron_store_path.parent.mkdir(parents=True, exist_ok=True)
+        cron = CronService(cron_store_path)
+
+        async def on_cron_job_mt(job: CronJob) -> str | None:
+            if job.name == "dream":
+                try:
+                    await tenant_manager.run_dream_all()
+                    logger.info("Dream cron (multi-tenant) completed")
+                except Exception:
+                    logger.exception("Dream cron (multi-tenant) failed")
+                return None
+            return None
+
+        cron.on_job = on_cron_job_mt
+
+        async def multi_heartbeat_loop() -> None:
+            while True:
+                try:
+                    await asyncio.sleep(hb_cfg.interval_s)
+                except asyncio.CancelledError:
+                    break
+                if not hb_cfg.enabled:
+                    continue
+                for ws in tenant_manager.iter_profile_workspaces():
+                    try:
+                        tenant = await tenant_manager.ensure_tenant_by_workspace(ws)
+                        if not tenant:
+                            continue
+
+                        async def on_ex(tasks: str, t=tenant) -> str:
+                            ch, cid = _pick_routable_heartbeat_target(
+                                workspace=t.workspace,
+                                enabled_channels=set(channels.enabled_channels),
+                                session_manager=t.loop.sessions,
+                            )
+                            if ch == "cli":
+                                return ""
+
+                            async def _silent(*_a, **_k) -> None:
+                                pass
+
+                            resp = await t.loop.process_direct(
+                                tasks,
+                                session_key="heartbeat",
+                                channel=ch,
+                                chat_id=cid,
+                                on_progress=_silent,
+                            )
+                            sess = t.loop.sessions.get_or_create("heartbeat")
+                            sess.retain_recent_legal_suffix(hb_cfg.keep_recent_messages)
+                            t.loop.sessions.save(sess)
+                            return resp.content if resp else ""
+
+                        async def on_no(response: str, t=tenant) -> None:
+                            ch, cid = _pick_routable_heartbeat_target(
+                                workspace=t.workspace,
+                                enabled_channels=set(channels.enabled_channels),
+                                session_manager=t.loop.sessions,
+                            )
+                            if ch == "cli":
+                                return
+                            await shared_outbound.put(
+                                OutboundMessage(channel=ch, chat_id=cid, content=response)
+                            )
+
+                        hb_once = HeartbeatService(
+                            workspace=tenant.workspace,
+                            provider=provider,
+                            model=tenant.loop.model,
+                            on_execute=on_ex,
+                            on_notify=on_no,
+                            interval_s=hb_cfg.interval_s,
+                            enabled=True,
+                            timezone=config.agents.defaults.timezone,
+                        )
+                        await hb_once.tick_once()
+                    except Exception:
+                        logger.exception("Heartbeat tick failed for workspace {}", ws)
+
+        if channels.enabled_channels:
+            console.print(
+                f"[green]✓[/green] Multi-tenant gateway; channels: {', '.join(channels.enabled_channels)}"
+            )
+        else:
+            console.print("[yellow]Warning: No channels enabled[/yellow]")
+        console.print(f"[green]✓[/green] Tenants directory: {tenants_dir}")
+        console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s (per onboarded tenant)")
+        cron.register_system_job(CronJob(
+            id="dream",
+            name="dream",
+            schedule=dream_cfg.build_schedule(config.agents.defaults.timezone),
+            payload=CronPayload(kind="system_event"),
+        ))
+        console.print(f"[green]✓[/green] Dream: {dream_cfg.describe_schedule()} (all tenants)")
+
+        async def run_mt() -> None:
+            hb_task = asyncio.create_task(multi_heartbeat_loop())
+            try:
+                await cron.start()
+                await asyncio.gather(router.run(), channels.start_all())
+            except KeyboardInterrupt:
+                console.print("\nShutting down...")
+            except Exception:
+                import traceback
+                console.print("\n[red]Error: Gateway crashed unexpectedly[/red]")
+                console.print(traceback.format_exc())
+            finally:
+                router.stop()
+                hb_task.cancel()
+                try:
+                    await hb_task
+                except asyncio.CancelledError:
+                    pass
+                await tenant_manager.shutdown_all()
+                cron.stop()
+                await channels.stop_all()
+
+        asyncio.run(run_mt())
+        return
+
+    bus = MessageBus(maxsize=100)
     session_manager = SessionManager(config.workspace_path)
 
     # Preserve existing single-workspace installs, but keep custom workspaces clean.
@@ -712,19 +842,11 @@ def gateway(
 
     def _pick_heartbeat_target() -> tuple[str, str]:
         """Pick a routable channel/chat target for heartbeat-triggered messages."""
-        enabled = set(channels.enabled_channels)
-        # Prefer the most recently updated non-internal session on an enabled channel.
-        for item in session_manager.list_sessions():
-            key = item.get("key") or ""
-            if ":" not in key:
-                continue
-            channel, chat_id = key.split(":", 1)
-            if channel in {"cli", "system"}:
-                continue
-            if channel in enabled and chat_id:
-                return channel, chat_id
-        # Fallback keeps prior behavior but remains explicit.
-        return "cli", "direct"
+        return _pick_routable_heartbeat_target(
+            workspace=config.workspace_path,
+            enabled_channels=set(channels.enabled_channels),
+            session_manager=session_manager,
+        )
 
     # Create heartbeat service
     async def on_heartbeat_execute(tasks: str) -> str:
@@ -758,7 +880,6 @@ def gateway(
             return  # No external channel available to deliver to
         await bus.publish_outbound(OutboundMessage(channel=channel, chat_id=chat_id, content=response))
 
-    hb_cfg = config.gateway.heartbeat
     heartbeat = HeartbeatService(
         workspace=config.workspace_path,
         provider=provider,
@@ -782,12 +903,10 @@ def gateway(
     console.print(f"[green]✓[/green] Heartbeat: every {hb_cfg.interval_s}s")
 
     # Register Dream system job (always-on, idempotent on restart)
-    dream_cfg = config.agents.defaults.dream
     if dream_cfg.model_override:
         agent.dream.model = dream_cfg.model_override
     agent.dream.max_batch_size = dream_cfg.max_batch_size
     agent.dream.max_iterations = dream_cfg.max_iterations
-    from nanobot.cron.types import CronJob, CronPayload
     cron.register_system_job(CronJob(
         id="dream",
         name="dream",

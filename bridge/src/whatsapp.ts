@@ -37,7 +37,7 @@ export interface WhatsAppClientOptions {
   authDir: string;
   onMessage: (msg: InboundMessage) => void;
   onQR: (qr: string) => void;
-  onStatus: (status: string) => void;
+  onStatus: (status: string | { status: string; jid?: string; phone?: string }) => void;
 }
 
 export class WhatsAppClient {
@@ -51,6 +51,10 @@ export class WhatsAppClient {
 
   private normalizeJid(jid: string | undefined | null): string {
     return (jid || '').split(':')[0];
+  }
+
+  private extractPhone(jid: string | undefined | null): string {
+    return this.normalizeJid(jid).replace(/\D/g, '');
   }
 
   private wasMentioned(msg: any): boolean {
@@ -130,7 +134,11 @@ export class WhatsAppClient {
         }
       } else if (connection === 'open') {
         console.log('✅ Connected to WhatsApp');
-        this.options.onStatus('connected');
+        this.options.onStatus({
+          status: 'connected',
+          jid: this.normalizeJid(this.sock?.user?.id),
+          phone: this.extractPhone(this.sock?.user?.id),
+        });
       }
     });
 

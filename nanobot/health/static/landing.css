@@ -1,0 +1,59 @@
+/* Landing is intentionally layered on top of onboard.css */
+
+.landing-card {
+  padding: 28px;
+}
+
+.landing-hero h1 {
+  margin: 6px 0 10px;
+  line-height: 1.05;
+  letter-spacing: -0.02em;
+}
+
+.landing-grid {
+  display: grid;
+  grid-template-columns: 1.1fr 0.9fr;
+  gap: 16px;
+  margin-top: 18px;
+}
+
+.landing-panel {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+  border-radius: 18px;
+  background: rgba(31, 107, 73, 0.06);
+  border: 1px solid rgba(31, 107, 73, 0.12);
+}
+
+.landing-panel h2 {
+  margin: 0;
+}
+
+.how-list {
+  margin: 0;
+  padding-left: 18px;
+  color: #52655a;
+}
+
+.how-list li + li {
+  margin-top: 8px;
+}
+
+.signup {
+  display: grid;
+  gap: 12px;
+}
+
+.fineprint {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #52655a;
+}
+
+@media (max-width: 720px) {
+  .landing-grid {
+    grid-template-columns: 1fr;
+  }
+}
+

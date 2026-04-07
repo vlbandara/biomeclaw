@@ -11,7 +11,7 @@ from typing import Any, Literal
 
 from loguru import logger
 from pydantic import Field
-from telegram import BotCommand, ReactionTypeEmoji, ReplyParameters, Update
+from telegram import BotCommand, InlineKeyboardButton, InlineKeyboardMarkup, ReactionTypeEmoji, ReplyParameters, Update
 from telegram.error import BadRequest, NetworkError, TimedOut
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
 from telegram.request import HTTPXRequest
@@ -209,6 +209,7 @@ class TelegramChannel(BaseChannel):
         BotCommand("stop", "Stop the current task"),
         BotCommand("restart", "Restart the bot"),
         BotCommand("status", "Show bot status"),
+        BotCommand("onboard", "Create a one-time health onboarding link"),
         BotCommand("dream", "Run Dream memory consolidation now"),
         BotCommand("dream_log", "Show the latest Dream memory change"),
         BotCommand("dream_restore", "Restore Dream memory to an earlier version"),
@@ -235,6 +236,7 @@ class TelegramChannel(BaseChannel):
         self._bot_user_id: int | None = None
         self._bot_username: str | None = None
         self._stream_bufs: dict[str, _StreamBuf] = {}  # chat_id -> streaming state
+        self._runtime_token: str = self.config.token
 
     def is_allowed(self, sender_id: str) -> bool:
         """Preserve Telegram's legacy id|username allowlist matching."""
@@ -268,11 +270,15 @@ class TelegramChannel(BaseChannel):
 
     async def start(self) -> None:
         """Start the Telegram bot with long polling."""
-        if not self.config.token:
-            logger.error("Telegram bot token not configured")
-            return
-
         self._running = True
+        token = self._resolve_runtime_token()
+        while self._running and not token:
+            logger.info("Telegram token not configured yet, waiting for hosted setup...")
+            await asyncio.sleep(2)
+            token = self._resolve_runtime_token()
+        if not self._running or not token:
+            return
+        self._runtime_token = token
 
         proxy = self.config.proxy or None
 
@@ -293,7 +299,7 @@ class TelegramChannel(BaseChannel):
         )
         builder = (
             Application.builder()
-            .token(self.config.token)
+            .token(token)
             .request(api_request)
             .get_updates_request(poll_request)
         )
@@ -304,7 +310,7 @@ class TelegramChannel(BaseChannel):
         self._app.add_handler(MessageHandler(filters.Regex(r"^/start(?:@\w+)?$"), self._on_start))
         self._app.add_handler(
             MessageHandler(
-                filters.Regex(r"^/(new|stop|restart|status|dream)(?:@\w+)?(?:\s+.*)?$"),
+                filters.Regex(r"^/(new|stop|restart|status|onboard|dream)(?:@\w+)?(?:\s+.*)?$"),
                 self._forward_command,
             )
         )
@@ -353,6 +359,21 @@ class TelegramChannel(BaseChannel):
         # Keep running until stopped
         while self._running:
             await asyncio.sleep(1)
+
+    def _resolve_runtime_token(self) -> str:
+        configured = (self.config.token or "").strip()
+        if configured:
+            return configured
+        if not self.workspace:
+            return ""
+        from nanobot.health.storage import HealthWorkspace
+
+        health = HealthWorkspace(self.workspace)
+        try:
+            secrets = health.load_setup_secrets()
+        except Exception:
+            return ""
+        return str(secrets.get("telegram", {}).get("bot_token", "")).strip()
 
     async def stop(self) -> None:
         """Stop the Telegram bot."""
@@ -635,6 +656,34 @@ class TelegramChannel(BaseChannel):
             return
 
         user = update.effective_user
+        from nanobot.health.storage import HealthWorkspace, health_distribution_enabled, is_health_workspace
+
+        if self.workspace and health_distribution_enabled(self.workspace) and not is_health_workspace(self.workspace):
+            health = HealthWorkspace(self.workspace)
+            setup = health.load_setup()
+            if setup and health.validate_setup_token(setup.get("token", "")):
+                url = health.setup_url(setup["token"])
+                button_label = "Start setup"
+                description = "Tap below to finish setup on your phone."
+            else:
+                token, _ = health.get_or_create_invite(
+                    channel="telegram",
+                    chat_id=str(update.message.chat_id),
+                )
+                url = health.onboarding_url(token)
+                button_label = "Start onboarding"
+                description = "Tap below to complete the onboarding form on your phone."
+            await update.message.reply_text(
+                (
+                    f"👋 Hi {user.first_name}! Let's set up your health assistant first.\n\n"
+                    f"{description}"
+                ),
+                reply_markup=InlineKeyboardMarkup(
+                    [[InlineKeyboardButton(button_label, url=url)]]
+                ),
+            )
+            return
+
         await update.message.reply_text(
             f"👋 Hi {user.first_name}! I'm nanobot.\n\n"
             "Send me a message and I'll respond!\n"

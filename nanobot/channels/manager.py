@@ -11,6 +11,7 @@ from nanobot.bus.events import OutboundMessage
 from nanobot.bus.queue import MessageBus
 from nanobot.channels.base import BaseChannel
 from nanobot.config.schema import Config
+from nanobot.health.storage import health_distribution_enabled
 from nanobot.utils.restart import consume_restart_notice_from_env, format_restart_completed_message
 
 # Retry delays for message sending (exponential backoff: 1s, 2s, 4s)
@@ -40,21 +41,31 @@ class ChannelManager:
         from nanobot.channels.registry import discover_all
 
         groq_key = self.config.providers.groq.api_key
+        hosted_setup_mode = health_distribution_enabled(self.config.workspace_path)
 
         for name, cls in discover_all().items():
             section = getattr(self.config.channels, name, None)
-            if section is None:
+            if section is None and not (hosted_setup_mode and name in {"telegram", "whatsapp"}):
                 continue
+            if section is None:
+                section = cls.default_config()
+            if hosted_setup_mode and name in {"telegram", "whatsapp"} and isinstance(section, dict):
+                section = {**section}
+                if not section.get("allowFrom") and not section.get("allow_from"):
+                    section["allowFrom"] = ["*"]
             enabled = (
                 section.get("enabled", False)
                 if isinstance(section, dict)
                 else getattr(section, "enabled", False)
             )
+            if hosted_setup_mode and name == "telegram":
+                enabled = True
             if not enabled:
                 continue
             try:
                 channel = cls(section, self.bus)
                 channel.transcription_api_key = groq_key
+                channel.workspace = self.config.workspace_path
                 self.channels[name] = channel
                 logger.info("{} channel enabled", cls.display_name)
             except Exception as e:

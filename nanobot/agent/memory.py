@@ -12,12 +12,17 @@ from typing import TYPE_CHECKING, Any, Callable
 
 from loguru import logger
 
-from nanobot.utils.prompt_templates import render_template
-from nanobot.utils.helpers import ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think
-
-from nanobot.agent.runner import AgentRunSpec, AgentRunner
+from nanobot.agent.runner import AgentRunner, AgentRunSpec
 from nanobot.agent.tools.registry import ToolRegistry
+from nanobot.health.storage import is_health_workspace
 from nanobot.utils.gitstore import GitStore
+from nanobot.utils.helpers import (
+    ensure_dir,
+    estimate_message_tokens,
+    estimate_prompt_tokens_chain,
+    strip_think,
+)
+from nanobot.utils.prompt_templates import render_template
 
 if TYPE_CHECKING:
     from nanobot.providers.base import LLMProvider
@@ -286,7 +291,7 @@ class MemoryStore:
                 read_size = min(size, 4096)
                 f.seek(size - read_size)
                 data = f.read().decode("utf-8")
-                lines = [l for l in data.split("\n") if l.strip()]
+                lines = [ln for ln in data.split("\n") if ln.strip()]
                 if not lines:
                     return None
                 return json.loads(lines[-1])
@@ -311,6 +316,33 @@ class MemoryStore:
 
     def set_last_dream_cursor(self, cursor: int) -> None:
         self._dream_cursor_file.write_text(str(cursor), encoding="utf-8")
+
+    @property
+    def dream_pending_file(self) -> Path:
+        return self.memory_dir / ".dream_pending.json"
+
+    def read_dream_pending(self) -> dict[str, Any] | None:
+        path = self.dream_pending_file
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            return data if isinstance(data, dict) else None
+        except Exception:
+            return None
+
+    def write_dream_pending(self, analysis: str, end_cursor: int) -> None:
+        payload = {"analysis": analysis, "end_cursor": end_cursor}
+        self.dream_pending_file.write_text(
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+    def clear_dream_pending(self) -> None:
+        try:
+            self.dream_pending_file.unlink(missing_ok=True)
+        except OSError:
+            pass
 
     # -- message formatting utility ------------------------------------------
 
@@ -554,10 +586,67 @@ class Dream:
         tools.register(EditFileTool(workspace=workspace, allowed_dir=workspace))
         return tools
 
+    def _render_dream_system_prompt(self, template_name: str) -> str:
+        prompt = render_template(template_name, strip=True)
+        if is_health_workspace(self.store.workspace):
+            prompt += "\n\n" + render_template("health/dream_appendix.md", strip=True)
+        return prompt
+
     # -- main entry ----------------------------------------------------------
+
+    def _file_context_block(self) -> str:
+        current_memory = self.store.read_memory() or "(empty)"
+        current_soul = self.store.read_soul() or "(empty)"
+        current_user = self.store.read_user() or "(empty)"
+        return (
+            f"## Current MEMORY.md\n{current_memory}\n\n"
+            f"## Current SOUL.md\n{current_soul}\n\n"
+            f"## Current USER.md\n{current_user}"
+        )
+
+    async def _run_phase2(self, analysis: str, file_context: str):
+        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}"
+        messages: list[dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": self._render_dream_system_prompt("agent/dream_phase2.md"),
+            },
+            {"role": "user", "content": phase2_prompt},
+        ]
+        return await self._runner.run(AgentRunSpec(
+            initial_messages=messages,
+            tools=self._tools,
+            model=self.model,
+            max_iterations=self.max_iterations,
+            max_tool_result_chars=self.max_tool_result_chars,
+            fail_on_tool_error=False,
+        ))
 
     async def run(self) -> bool:
         """Process unprocessed history entries. Returns True if work was done."""
+        file_context = self._file_context_block()
+        pending = self.store.read_dream_pending()
+        if pending:
+            analysis = str(pending.get("analysis") or "")
+            try:
+                end_cursor = int(pending["end_cursor"])
+            except (KeyError, TypeError, ValueError):
+                self.store.clear_dream_pending()
+                return False
+            if not analysis:
+                self.store.clear_dream_pending()
+                return False
+            logger.info("Dream: retry Phase 2 for pending batch (cursor target {})", end_cursor)
+            try:
+                result = await self._run_phase2(analysis, file_context)
+            except Exception:
+                logger.exception("Dream Phase 2 failed (retry)")
+                return True
+            if not result or result.stop_reason != "completed":
+                logger.warning("Dream Phase 2 retry incomplete ({})", getattr(result, "stop_reason", None))
+                return True
+            return self._dream_success_finalize(result, end_cursor=end_cursor, batch_timestamp="")
+
         last_cursor = self.store.get_last_dream_cursor()
         entries = self.store.read_unprocessed_history(since_cursor=last_cursor)
         if not entries:
@@ -569,25 +658,10 @@ class Dream:
             len(entries), last_cursor, batch[-1]["cursor"], len(batch),
         )
 
-        # Build history text for LLM
         history_text = "\n".join(
             f"[{e['timestamp']}] {e['content']}" for e in batch
         )
-
-        # Current file contents
-        current_memory = self.store.read_memory() or "(empty)"
-        current_soul = self.store.read_soul() or "(empty)"
-        current_user = self.store.read_user() or "(empty)"
-        file_context = (
-            f"## Current MEMORY.md\n{current_memory}\n\n"
-            f"## Current SOUL.md\n{current_soul}\n\n"
-            f"## Current USER.md\n{current_user}"
-        )
-
-        # Phase 1: Analyze
-        phase1_prompt = (
-            f"## Conversation History\n{history_text}\n\n{file_context}"
-        )
+        phase1_prompt = f"## Conversation History\n{history_text}\n\n{file_context}"
 
         try:
             phase1_response = await self.provider.chat_with_retry(
@@ -595,7 +669,7 @@ class Dream:
                 messages=[
                     {
                         "role": "system",
-                        "content": render_template("agent/dream_phase1.md", strip=True),
+                        "content": self._render_dream_system_prompt("agent/dream_phase1.md"),
                     },
                     {"role": "user", "content": phase1_prompt},
                 ],
@@ -608,62 +682,48 @@ class Dream:
             logger.exception("Dream Phase 1 failed")
             return False
 
-        # Phase 2: Delegate to AgentRunner with read_file / edit_file
-        phase2_prompt = f"## Analysis Result\n{analysis}\n\n{file_context}"
-
-        tools = self._tools
-        messages: list[dict[str, Any]] = [
-            {
-                "role": "system",
-                "content": render_template("agent/dream_phase2.md", strip=True),
-            },
-            {"role": "user", "content": phase2_prompt},
-        ]
+        end_cursor = batch[-1]["cursor"]
+        batch_ts = batch[-1]["timestamp"]
 
         try:
-            result = await self._runner.run(AgentRunSpec(
-                initial_messages=messages,
-                tools=tools,
-                model=self.model,
-                max_iterations=self.max_iterations,
-                max_tool_result_chars=self.max_tool_result_chars,
-                fail_on_tool_error=False,
-            ))
+            result = await self._run_phase2(analysis, file_context)
             logger.debug(
                 "Dream Phase 2 complete: stop_reason={}, tool_events={}",
                 result.stop_reason, len(result.tool_events),
             )
         except Exception:
             logger.exception("Dream Phase 2 failed")
-            result = None
+            self.store.write_dream_pending(analysis, end_cursor)
+            return True
 
-        # Build changelog from tool events
+        if result.stop_reason != "completed":
+            self.store.write_dream_pending(analysis, end_cursor)
+            logger.warning(
+                "Dream incomplete ({}): saved pending for Phase 2 retry",
+                result.stop_reason,
+            )
+            return True
+
+        return self._dream_success_finalize(result, end_cursor=end_cursor, batch_timestamp=batch_ts)
+
+    def _dream_success_finalize(self, result, *, end_cursor: int, batch_timestamp: str) -> bool:
         changelog: list[str] = []
         if result and result.tool_events:
             for event in result.tool_events:
                 if event["status"] == "ok":
                     changelog.append(f"{event['name']}: {event['detail']}")
 
-        # Advance cursor — always, to avoid re-processing Phase 1
-        new_cursor = batch[-1]["cursor"]
-        self.store.set_last_dream_cursor(new_cursor)
+        self.store.set_last_dream_cursor(end_cursor)
+        self.store.clear_dream_pending()
         self.store.compact_history()
 
-        if result and result.stop_reason == "completed":
-            logger.info(
-                "Dream done: {} change(s), cursor advanced to {}",
-                len(changelog), new_cursor,
-            )
-        else:
-            reason = result.stop_reason if result else "exception"
-            logger.warning(
-                "Dream incomplete ({}): cursor advanced to {}",
-                reason, new_cursor,
-            )
+        logger.info(
+            "Dream done: {} change(s), cursor advanced to {}",
+            len(changelog), end_cursor,
+        )
 
-        # Git auto-commit (only when there are actual changes)
         if changelog and self.store.git.is_initialized():
-            ts = batch[-1]["timestamp"]
+            ts = batch_timestamp or "unknown"
             sha = self.store.git.auto_commit(f"dream: {ts}, {len(changelog)} change(s)")
             if sha:
                 logger.info("Dream commit: {}", sha)

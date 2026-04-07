@@ -1,0 +1,43 @@
+{
+  "agents": {
+    "defaults": {
+      "workspace": "~/.nanobot/workspace",
+      "provider": "minimax",
+      "model": "MiniMax-M2.7",
+      "contextWindowTokens": 204800,
+      "maxTokens": 4096,
+      "temperature": 0.2,
+      "providerRetryMode": "persistent",
+      "dream": {
+        "intervalH": 2,
+        "maxBatchSize": 20,
+        "maxIterations": 10
+      }
+    }
+  },
+  "providers": {
+    "minimax": {
+      "apiKey": "ENV:MINIMAX_API_KEY"
+    }
+  },
+  "channels": {
+    "telegram": {
+      "enabled": true,
+      "token": "ENV:TELEGRAM_BOT_TOKEN",
+      "allowFrom": ["*"]
+    },
+    "whatsapp": {
+      "enabled": false,
+      "allowFrom": ["*"],
+      "bridgeUrl": "ws://whatsapp-bridge:3001",
+      "bridgeToken": "ENV:WHATSAPP_BRIDGE_TOKEN"
+    }
+  },
+  "gateway": {
+    "heartbeat": {
+      "enabled": true,
+      "intervalS": 1800,
+      "keepRecentMessages": 8
+    }
+  }
+}

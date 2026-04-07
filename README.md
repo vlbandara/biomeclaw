@@ -1552,13 +1552,19 @@ Example config:
   "channels": {
     "telegram": {
       "enabled": true,
-      "token": "YOUR_TELEGRAM_BOT_TOKEN"
+      "token": "ENV:TELEGRAM_BOT_TOKEN"
     }
   },
   "gateway": {
     "port": 18790
   }
 }
+```
+
+Then export the secret instead of storing it in JSON:
+
+```bash
+export TELEGRAM_BOT_TOKEN=your_telegram_bot_token
 ```
 
 Start separate instances:
