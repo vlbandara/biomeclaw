@@ -110,7 +110,10 @@ class WorkerSettings:
 
 
 async def _run() -> None:
-    worker = Worker(WorkerSettings)
+    worker = Worker(
+        functions=WorkerSettings.functions,
+        redis_settings=WorkerSettings.redis_settings,
+    )
     await worker.async_run()
 
 
@@ -120,4 +123,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
