@@ -13,6 +13,7 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
+  checks: read
   contents: read
   statuses: read
 
@@ -37,13 +38,21 @@ jobs:
         with:
           ref: ${{ inputs.ref }}
 
-      - name: Verify main commit status is green
+      - name: Verify main checks are green
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          state="$(gh api repos/${GITHUB_REPOSITORY}/commits/${{ inputs.ref }}/status --jq '.state')"
-          if [[ "${state}" != "success" ]]; then
-            echo "Ref ${{ inputs.ref }} is not green. Current state: ${state}"
+          sha="$(git rev-parse HEAD)"
+          checks_json="$(gh api repos/${GITHUB_REPOSITORY}/commits/${sha}/check-runs)"
+          total_checks="$(jq '[.check_runs[] | select(.name != "deploy")] | length' <<<"${checks_json}")"
+          failing_checks="$(jq -r '[.check_runs[] | select(.name != "deploy" and (.status != "completed" or .conclusion != "success")) | "\(.name):\(.status):\(.conclusion // "none")"] | .[]' <<<"${checks_json}")"
+          if [[ "${total_checks}" -eq 0 ]]; then
+            echo "No completed checks found for ${sha}."
+            exit 1
+          fi
+          if [[ -n "${failing_checks}" ]]; then
+            echo "Ref ${sha} is not green:"
+            printf '%s\n' "${failing_checks}"
             exit 1
           fi
 
