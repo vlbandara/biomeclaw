@@ -4,14 +4,13 @@ import json
 from pathlib import Path
 
 import pytest
-
-fastapi = pytest.importorskip("fastapi")
-pytest.importorskip("starlette")
-
 from fastapi.testclient import TestClient
 
 from nanobot.health.api import create_app
 from nanobot.health.storage import HealthWorkspace
+
+fastapi = pytest.importorskip("fastapi")
+pytest.importorskip("starlette")
 
 
 def _payload(full_name: str = "Jane Doe") -> dict:
@@ -93,6 +92,7 @@ def _minimal_payload(full_name: str = "Jane Doe") -> dict:
 
 
 def _make_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, HealthWorkspace]:
+    monkeypatch.delenv("NANOBOT_HEALTH_REGISTRY_URL", raising=False)
     monkeypatch.setenv("NANOBOT_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("HEALTH_VAULT_KEY", "test-health-vault-key")
     monkeypatch.setenv("HEALTH_TELEGRAM_BOT_URL", "https://t.me/example_bot")

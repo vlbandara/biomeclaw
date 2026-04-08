@@ -1,0 +1,66 @@
+name: Deploy Production
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Git ref to deploy
+        required: true
+        default: main
+
+concurrency:
+  group: prod-deploy
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  statuses: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    env:
+      PROD_HOST: ${{ secrets.PROD_HOST }}
+      PROD_USER: ${{ secrets.PROD_USER }}
+      PROD_APP_DIR: ${{ secrets.PROD_APP_DIR }}
+      PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+    steps:
+      - name: Require main
+        run: |
+          if [[ "${{ inputs.ref }}" != "main" ]]; then
+            echo "Deployments are restricted to main."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Verify main commit status is green
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          state="$(gh api repos/${GITHUB_REPOSITORY}/commits/${{ inputs.ref }}/status --jq '.state')"
+          if [[ "${state}" != "success" ]]; then
+            echo "Ref ${{ inputs.ref }} is not green. Current state: ${state}"
+            exit 1
+          fi
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${PROD_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${PROD_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Run production deploy
+        run: bash scripts/prod/deploy.sh --host "${PROD_HOST}" --user "${PROD_USER}" --app-dir "${PROD_APP_DIR}" --base-url "${PROD_BASE_URL}" --out-dir artifacts/deploy
+
+      - name: Upload deploy artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: deploy-prod-artifacts
+          path: artifacts/deploy
+          if-no-files-found: warn

@@ -46,7 +46,9 @@ if (form && statusNode) {
     const response = await fetch(url, options);
     const data = await response.json().catch(() => ({}));
     if (!response.ok) {
-      throw new Error(data.detail || "Request failed.");
+      const ref = data.errorId || data.requestId || response.headers.get("X-Request-ID") || "";
+      const baseMessage = data.detail || "Request failed.";
+      throw new Error(ref ? `${baseMessage} Ref: ${ref}` : baseMessage);
     }
     return data;
   }

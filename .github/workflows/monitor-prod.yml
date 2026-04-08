@@ -1,0 +1,121 @@
+name: Monitor Production
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "*/10 * * * *"
+
+concurrency:
+  group: prod-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  issues: write
+
+jobs:
+  monitor:
+    runs-on: ubuntu-latest
+    env:
+      PROD_HOST: ${{ secrets.PROD_HOST }}
+      PROD_USER: ${{ secrets.PROD_USER }}
+      PROD_APP_DIR: ${{ secrets.PROD_APP_DIR }}
+      PROD_BASE_URL: ${{ secrets.PROD_BASE_URL }}
+      PROD_SSH_KEY: ${{ secrets.PROD_SSH_KEY }}
+      TELEGRAM_ALERT_BOT_TOKEN: ${{ secrets.TELEGRAM_ALERT_BOT_TOKEN }}
+      TELEGRAM_ALERT_CHAT_ID: ${{ secrets.TELEGRAM_ALERT_CHAT_ID }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure SSH key
+        run: |
+          mkdir -p ~/.ssh
+          printf '%s\n' "${PROD_SSH_KEY}" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -H "${PROD_HOST}" >> ~/.ssh/known_hosts
+
+      - name: Run smoke checks
+        id: smoke
+        continue-on-error: true
+        run: bash scripts/prod/smoke_check.sh --host "${PROD_HOST}" --user "${PROD_USER}" --app-dir "${PROD_APP_DIR}" --base-url "${PROD_BASE_URL}" --out-dir artifacts/smoke
+
+      - name: Collect diagnostics on failure
+        if: steps.smoke.outcome == 'failure'
+        run: bash scripts/prod/collect_diagnostics.sh --host "${PROD_HOST}" --user "${PROD_USER}" --app-dir "${PROD_APP_DIR}" --base-url "${PROD_BASE_URL}" --out-dir artifacts/diagnostics | tee artifacts/diagnostics-path.txt
+
+      - name: Upload monitoring artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: monitor-prod-artifacts
+          path: artifacts
+          if-no-files-found: warn
+
+      - name: Summarize failure
+        if: steps.smoke.outcome == 'failure'
+        id: incident
+        run: |
+          python3 - <<'PY' >> "$GITHUB_OUTPUT"
+          import json
+          from pathlib import Path
+
+          summary = json.loads(Path("artifacts/smoke/summary.json").read_text(encoding="utf-8"))
+          failures = summary.get("failures") or ["unknown"]
+          first = failures[0]
+          signature = first.replace(":", "-").replace("/", "-").replace("_", "-")
+          subsystem = "runtime"
+          if first.startswith("endpoint:"):
+              subsystem = "api"
+          elif "log_pattern" in first:
+              subsystem = "logs"
+          elif "compose" in first:
+              subsystem = "runtime"
+          message = "Production smoke check failed: " + ", ".join(failures[:3])
+          print(f"signature={signature}")
+          print(f"subsystem={subsystem}")
+          print(f"summary={message}")
+          PY
+
+      - name: Send Telegram alert
+        if: steps.smoke.outcome == 'failure'
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          bash scripts/prod/notify_telegram.sh \
+            --bot-token "${TELEGRAM_ALERT_BOT_TOKEN}" \
+            --chat-id "${TELEGRAM_ALERT_CHAT_ID}" \
+            --message "BiomeClaw prod alert: ${{ steps.incident.outputs.summary }}. Run: ${run_url}"
+
+      - name: Create or update incident
+        if: steps.smoke.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          bash scripts/prod/report_incident.sh \
+            --repo "${GITHUB_REPOSITORY}" \
+            --signature "${{ steps.incident.outputs.signature }}" \
+            --subsystem "${{ steps.incident.outputs.subsystem }}" \
+            --summary "${{ steps.incident.outputs.summary }}" \
+            --run-url "${run_url}" \
+            --artifact-note "monitor-prod-artifacts in ${run_url}"
+
+      - name: Resolve open monitor incidents after recovery
+        if: steps.smoke.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh label create monitor --repo "${GITHUB_REPOSITORY}" --color CFD3D7 --description "Managed by production reliability automation" --force >/dev/null 2>&1 || true
+          open_issues="$(gh issue list --repo "${GITHUB_REPOSITORY}" --state open --label incident --label prod --label monitor --json number --jq '.[].number')"
+          if [[ -z "${open_issues}" ]]; then
+            exit 0
+          fi
+          run_url="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          while read -r issue_number; do
+            [[ -n "${issue_number}" ]] || continue
+            gh issue comment "${issue_number}" --repo "${GITHUB_REPOSITORY}" --body "Production monitor recovered. Run: ${run_url}" >/dev/null
+            gh issue close "${issue_number}" --repo "${GITHUB_REPOSITORY}" >/dev/null
+          done <<< "${open_issues}"
+
+      - name: Fail workflow if smoke checks failed
+        if: steps.smoke.outcome == 'failure'
+        run: exit 1

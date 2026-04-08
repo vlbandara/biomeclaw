@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 from pathlib import Path
 from unittest.mock import AsyncMock
 
@@ -56,6 +57,7 @@ def _payload() -> dict:
 
 
 def _make_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[TestClient, HealthWorkspace]:
+    monkeypatch.delenv("NANOBOT_HEALTH_REGISTRY_URL", raising=False)
     monkeypatch.setenv("NANOBOT_WORKSPACE", str(tmp_path))
     monkeypatch.setenv("HEALTH_VAULT_KEY", "test-health-vault-key")
     monkeypatch.setenv("HEALTH_TELEGRAM_BOT_URL", "https://t.me/example_bot")
@@ -222,3 +224,65 @@ def test_setup_allows_openrouter_provider(tmp_path: Path, monkeypatch: pytest.Mo
     setup = health.load_setup()
     assert setup["provider"]["provider"] == "openrouter"
     assert setup["provider"]["model"] == "openai/gpt-4o-mini"
+
+
+def test_setup_activate_spawn_failure_returns_reference_and_logs(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    client, _ = _make_client(tmp_path, monkeypatch)
+    token = "setup-spawn-failure-token"
+    health = _setup_session_health(tmp_path, token)
+    health.create_setup_session_with_token(token)
+    monkeypatch.setattr(
+        "nanobot.health.api.validate_provider_credentials",
+        AsyncMock(return_value={"provider": "minimax", "label": "MiniMax", "model": "MiniMax-M2.7"}),
+    )
+    monkeypatch.setattr(
+        "nanobot.health.api.validate_telegram_bot_token",
+        AsyncMock(
+            return_value={
+                "bot_id": 123456,
+                "bot_username": "healthbot_test",
+                "bot_name": "Health Bot",
+                "bot_url": "https://t.me/healthbot_test",
+            }
+        ),
+    )
+    monkeypatch.setattr("nanobot.health.api.register_telegram_commands", AsyncMock(return_value=None))
+    monkeypatch.setattr(client.app.state.registry, "get_by_setup_token", AsyncMock(return_value=None))
+    monkeypatch.setattr(
+        client.app.state.spawner,
+        "spawn_instance",
+        lambda **_kwargs: (_ for _ in ()).throw(RuntimeError("docker unavailable")),
+    )
+    caplog.set_level(logging.ERROR, logger="nanobot.health.api")
+
+    assert client.post(
+        f"/api/setup/{token}/provider",
+        json={"provider": "minimax", "api_key": "minimax-secret-key"},
+    ).status_code == 200
+    assert client.post(
+        f"/api/setup/{token}/channels/telegram",
+        json={"bot_token": "123:abc"},
+    ).status_code == 200
+    assert client.post(f"/api/setup/{token}/profile", json=_payload()).status_code == 200
+
+    response = client.post(
+        f"/api/setup/{token}/activate",
+        headers={"X-Request-ID": "req-activate-1"},
+    )
+
+    assert response.status_code == 502
+    assert response.headers["X-Request-ID"] == "req-activate-1"
+    assert response.json()["requestId"] == "req-activate-1"
+    assert response.json()["errorId"] == "req-activate-1"
+    assert "Unable to start your coach" in response.json()["detail"]
+    metrics = client.get("/metrics").json()
+    assert metrics["runtime"]["lastError"]["requestId"] == "req-activate-1"
+    assert metrics["runtime"]["lastError"]["statusCode"] == 502
+
+    error_records = [record for record in caplog.records if record.msg == "activate.spawn_failed"]
+    assert error_records
+    assert getattr(error_records[0], "request_id", "") == "req-activate-1"

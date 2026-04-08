@@ -1,34 +1,89 @@
-name: Test Suite
+name: CI
 
 on:
   push:
-    branches: [ main, nightly ]
   pull_request:
-    branches: [ main, nightly ]
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
 
 jobs:
-  test:
+  lint-and-validate:
+    runs-on: ubuntu-latest
+    env:
+      DOMAIN: example.com
+      MINIMAX_API_KEY: test-minimax-key
+      HEALTH_VAULT_KEY: test-health-vault-key
+      POSTGRES_PASSWORD: test-postgres-password
+      HEALTH_ONBOARDING_BASE_URL: https://example.com
+      APP_RELEASE: ci
+      APP_DEPLOYED_AT: 2026-01-01T00:00:00Z
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libolm-dev build-essential
+
+      - name: Install dependencies
+        run: uv sync --all-extras
+
+      - name: Run Ruff
+        run: uv run ruff check nanobot/health tests/health
+
+      - name: Validate shell scripts
+        run: |
+          bash -n deploy/health/hetzner_cutover.sh
+          bash -n scripts/prod/common.sh
+          bash -n scripts/prod/smoke_check.sh
+          bash -n scripts/prod/collect_diagnostics.sh
+          bash -n scripts/prod/deploy.sh
+          bash -n scripts/prod/notify_telegram.sh
+          bash -n scripts/prod/report_incident.sh
+
+      - name: Dry-run production deploy script
+        run: bash scripts/prod/deploy.sh --host 127.0.0.1 --base-url http://127.0.0.1 --dry-run --out-dir /tmp/biomeclaw-deploy-dry-run
+
+      - name: Validate docker compose services
+        run: docker compose config --services
+
+      - name: Render docker compose config
+        run: docker compose config >/tmp/docker-compose.rendered.yml
+
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
     runs-on: ubuntu-latest
     strategy:
+      fail-fast: false
       matrix:
         python-version: ["3.11", "3.12", "3.13"]
-
     steps:
-    - uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-    - name: Set up Python ${{ matrix.python-version }}
-      uses: actions/setup-python@v5
-      with:
-        python-version: ${{ matrix.python-version }}
+      - name: Set up Python ${{ matrix.python-version }}
+        uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
 
-    - name: Install uv
-      uses: astral-sh/setup-uv@v4
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
 
-    - name: Install system dependencies
-      run: sudo apt-get update && sudo apt-get install -y libolm-dev build-essential
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install -y libolm-dev build-essential
 
-    - name: Install all dependencies
-      run: uv sync --all-extras
+      - name: Install dependencies
+        run: uv sync --all-extras
 
-    - name: Run tests
-      run: uv run pytest tests/
+      - name: Run tests
+        run: uv run pytest tests/

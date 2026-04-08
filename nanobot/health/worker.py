@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
+import logging
 import os
 from pathlib import Path
 from typing import Any
@@ -9,12 +9,14 @@ from typing import Any
 from arq import Worker
 from arq.connections import RedisSettings
 
-from nanobot.health.api import _load_health_instance_config_template
+from nanobot.health.api import _configure_logging, _load_health_instance_config_template
 from nanobot.health.bootstrap import persist_health_onboarding
 from nanobot.health.metrics import spawn_attempts, spawn_failures, spawn_success
 from nanobot.health.registry import HealthRegistry
 from nanobot.health.spawner import HealthInstanceSpawner
 from nanobot.health.storage import HealthWorkspace, get_health_vault_secret
+
+logger = logging.getLogger("nanobot.health.worker")
 
 
 def _resolve_workspace_root() -> Path:
@@ -114,11 +116,17 @@ async def _run() -> None:
         functions=WorkerSettings.functions,
         redis_settings=WorkerSettings.redis_settings,
     )
+    logger.info("health.worker.starting")
     await worker.async_run()
 
 
 def main() -> None:
-    asyncio.run(_run())
+    _configure_logging()
+    try:
+        asyncio.run(_run())
+    except Exception:
+        logger.exception("health.worker.crashed")
+        raise
 
 
 if __name__ == "__main__":

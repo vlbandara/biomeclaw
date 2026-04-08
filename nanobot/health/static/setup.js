@@ -191,6 +191,7 @@ async function fetchJson(url, options = {}) {
   const response = await fetch(url, options);
   const data = await response.json().catch(() => ({}));
   if (!response.ok) {
+    const ref = data.errorId || data.requestId || response.headers.get("X-Request-ID") || "";
     const detail = data.detail;
     if (Array.isArray(detail)) {
       const message = detail
@@ -200,9 +201,11 @@ async function fetchJson(url, options = {}) {
           return path ? `${path}: ${msg}` : msg;
         })
         .join("; ");
-      throw new Error(message || "Request failed.");
+      const fullMessage = message || "Request failed.";
+      throw new Error(ref ? `${fullMessage} Ref: ${ref}` : fullMessage);
     }
-    throw new Error(detail || "Request failed.");
+    const baseMessage = detail || "Request failed.";
+    throw new Error(ref ? `${baseMessage} Ref: ${ref}` : baseMessage);
   }
   return data;
 }

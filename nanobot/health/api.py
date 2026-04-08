@@ -3,23 +3,30 @@
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import json
 import logging
 import os
 import time
+import uuid
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import HTMLResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
+from nanobot.health import metrics as health_metrics
 from nanobot.health.bootstrap import persist_health_onboarding
-from nanobot.health.registry import HealthRegistry
-from nanobot.health.spawner import HealthInstanceSpawner
+from nanobot.health.chat_workspace import (
+    parse_lifecycle_stage,
+    resolve_health_chat_workspace,
+    rough_knowledge_score,
+)
 from nanobot.health.hosted import (
     PROVIDER_CHOICES,
     WhatsAppBridgeMonitor,
@@ -30,13 +37,12 @@ from nanobot.health.hosted import (
     validate_provider_credentials,
     validate_telegram_bot_token,
 )
-from nanobot.health.chat_workspace import (
-    parse_lifecycle_stage,
-    resolve_health_chat_workspace,
-    rough_knowledge_score,
-)
+from nanobot.health.registry import HealthRegistry
+from nanobot.health.spawner import HealthInstanceSpawner
 from nanobot.health.storage import HealthWorkspace, get_health_vault_secret
-from nanobot.health import metrics as health_metrics
+
+logger = logging.getLogger("nanobot.health.api")
+_request_id_ctx: contextvars.ContextVar[str] = contextvars.ContextVar("nanobot_health_request_id", default="")
 
 
 class SignupSubmission(BaseModel):
@@ -125,6 +131,115 @@ class TelegramSetupSubmission(BaseModel):
 
 class WebChatMessage(BaseModel):
     message: str = Field(min_length=1, max_length=32000)
+
+
+def _request_id_from_request(request: Request | None) -> str:
+    if request is not None:
+        request_id = str(getattr(getattr(request, "state", None), "request_id", "") or "").strip()
+        if request_id:
+            return request_id
+    return _request_id_ctx.get("")
+
+
+def _stringify_detail(detail: Any) -> Any:
+    if isinstance(detail, (str, int, float, bool)) or detail is None:
+        return detail
+    if isinstance(detail, list):
+        try:
+            return json.loads(json.dumps(detail, ensure_ascii=False))
+        except Exception:
+            return [str(item) for item in detail]
+    if isinstance(detail, dict):
+        try:
+            return json.loads(json.dumps(detail, ensure_ascii=False))
+        except Exception:
+            return {str(key): str(value) for key, value in detail.items()}
+    return str(detail)
+
+
+def _runtime_metrics_state() -> dict[str, Any]:
+    return {
+        "requests": {
+            "total": 0,
+            "success": 0,
+            "clientErrors": 0,
+            "serverErrors": 0,
+        },
+        "lastError": {
+            "time": "",
+            "requestId": "",
+            "errorId": "",
+            "path": "",
+            "method": "",
+            "statusCode": 0,
+            "detail": "",
+        },
+        "release": {
+            "version": os.environ.get("APP_RELEASE", "").strip(),
+            "deployedAt": os.environ.get("APP_DEPLOYED_AT", "").strip(),
+        },
+    }
+
+
+def _record_runtime_error(
+    app: FastAPI,
+    *,
+    request: Request,
+    status_code: int,
+    detail: Any,
+) -> None:
+    runtime = getattr(app.state, "runtime_metrics", None)
+    if not isinstance(runtime, dict):
+        return
+    request_id = _request_id_from_request(request)
+    runtime["lastError"] = {
+        "time": datetime.now(UTC).isoformat(),
+        "requestId": request_id,
+        "errorId": request_id,
+        "path": request.url.path,
+        "method": request.method,
+        "statusCode": int(status_code),
+        "detail": _stringify_detail(detail),
+    }
+
+
+def _log_request_error(
+    request: Request,
+    *,
+    status_code: int,
+    detail: Any,
+    event: str,
+    exc: Exception | None = None,
+) -> None:
+    request_id = _request_id_from_request(request)
+    extra = {
+        "request_id": request_id,
+        "error_id": request_id,
+        "path": request.url.path,
+        "method": request.method,
+        "status_code": int(status_code),
+        "detail": _stringify_detail(detail),
+        "event": event,
+    }
+    if exc is None:
+        logger.error(event, extra=extra)
+    else:
+        logger.exception(event, extra=extra)
+
+
+def _json_error_response(
+    *,
+    status_code: int,
+    detail: Any,
+    request_id: str,
+) -> JSONResponse:
+    payload: dict[str, Any] = {
+        "detail": _stringify_detail(detail),
+        "requestId": request_id,
+    }
+    if status_code >= 500:
+        payload["errorId"] = request_id
+    return JSONResponse(payload, status_code=status_code, headers={"X-Request-ID": request_id})
 
 
 def _web_chat_nanobot(app: FastAPI, workspace: Path) -> Any:
@@ -272,12 +387,25 @@ class _JsonFormatter(logging.Formatter):
             "message": record.getMessage(),
             "time": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S%z"),
         }
+        for field in ("request_id", "error_id", "path", "method", "status_code", "detail", "event"):
+            value = getattr(record, field, None)
+            if value not in (None, ""):
+                payload[field] = value
         if record.exc_info:
             payload["exc_info"] = self.formatException(record.exc_info)
         try:
             return json.dumps(payload, ensure_ascii=False)
         except Exception:
             return f'{{"level":"{record.levelname}","message":"{record.getMessage()}"}}'
+
+
+class _RequestContextFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        if not getattr(record, "request_id", None):
+            request_id = _request_id_ctx.get("")
+            if request_id:
+                record.request_id = request_id
+        return True
 
 
 def _configure_logging() -> None:
@@ -288,8 +416,45 @@ def _configure_logging() -> None:
         return
     handler = logging.StreamHandler()
     handler.setFormatter(_JsonFormatter())
+    handler.addFilter(_RequestContextFilter())
     root.handlers = [handler]
     root.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
+
+async def _readiness_snapshot(app: FastAPI) -> tuple[bool, dict[str, Any]]:
+    checks: dict[str, Any] = {}
+    ok = True
+
+    try:
+        await app.state.registry.list_users()
+        checks["registry"] = {"status": "ok"}
+    except Exception as exc:
+        ok = False
+        checks["registry"] = {"status": "error", "detail": str(exc)}
+
+    monitor_task = getattr(app.state, "instance_monitor_task", None)
+    if monitor_task is not None and not monitor_task.done():
+        checks["instanceMonitor"] = {"status": "ok"}
+    else:
+        ok = False
+        checks["instanceMonitor"] = {"status": "error", "detail": "Instance monitor task is not running."}
+
+    if os.environ.get("NANOBOT_HEALTH_ASYNC_SPAWN", "").strip().lower() in {"1", "true", "yes", "on"}:
+        try:
+            from arq import create_pool
+            from arq.connections import RedisSettings
+
+            redis = await create_pool(
+                RedisSettings.from_dsn(os.environ.get("ARQ_REDIS_URL", "redis://redis:6379/0"))
+            )
+            await redis.ping()
+            await redis.close()
+            checks["asyncSpawnQueue"] = {"status": "ok"}
+        except Exception as exc:
+            ok = False
+            checks["asyncSpawnQueue"] = {"status": "error", "detail": str(exc)}
+
+    return ok, checks
 
 
 async def _container_health_monitor(app: FastAPI) -> None:
@@ -411,6 +576,7 @@ def create_app() -> FastAPI:
     app.state.channel_links = _channel_links()
     app.state.registry = HealthRegistry()
     app.state.spawner = HealthInstanceSpawner()
+    app.state.runtime_metrics = _runtime_metrics_state()
 
     monitor = WhatsAppBridgeMonitor(
         bridge_url=get_whatsapp_bridge_url(),
@@ -425,6 +591,79 @@ def create_app() -> FastAPI:
     templates = Jinja2Templates(directory=str(template_dir))
     app.state.templates = templates
     app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
+
+    @app.middleware("http")
+    async def request_context_middleware(request: Request, call_next):
+        request_id = (request.headers.get("X-Request-ID") or "").strip() or uuid.uuid4().hex[:12]
+        request.state.request_id = request_id
+        request.state.error_logged = False
+        token = _request_id_ctx.set(request_id)
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            if not request.state.error_logged:
+                _log_request_error(
+                    request,
+                    status_code=500,
+                    detail="Internal server error.",
+                    event="request.unhandled_exception",
+                    exc=exc,
+                )
+                request.state.error_logged = True
+            _record_runtime_error(
+                request.app,
+                request=request,
+                status_code=500,
+                detail="Internal server error.",
+            )
+            response = _json_error_response(
+                status_code=500,
+                detail="Internal server error.",
+                request_id=request_id,
+            )
+
+        response.headers["X-Request-ID"] = request_id
+        runtime = request.app.state.runtime_metrics["requests"]
+        runtime["total"] += 1
+        if response.status_code >= 500:
+            runtime["serverErrors"] += 1
+        elif response.status_code >= 400:
+            runtime["clientErrors"] += 1
+        else:
+            runtime["success"] += 1
+        _request_id_ctx.reset(token)
+        return response
+
+    @app.exception_handler(HTTPException)
+    async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
+        request_id = _request_id_from_request(request)
+        if exc.status_code >= 500 and not request.state.error_logged:
+            _log_request_error(
+                request,
+                status_code=exc.status_code,
+                detail=exc.detail,
+                event="request.http_exception",
+            )
+            request.state.error_logged = True
+            _record_runtime_error(
+                request.app,
+                request=request,
+                status_code=exc.status_code,
+                detail=exc.detail,
+            )
+        return _json_error_response(
+            status_code=exc.status_code,
+            detail=exc.detail,
+            request_id=request_id,
+        )
+
+    @app.exception_handler(RequestValidationError)
+    async def request_validation_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+        return _json_error_response(
+            status_code=422,
+            detail=exc.errors(),
+            request_id=_request_id_from_request(request),
+        )
 
     @app.on_event("startup")
     async def startup() -> None:
@@ -446,14 +685,36 @@ def create_app() -> FastAPI:
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
 
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        ok, checks = await _readiness_snapshot(app)
+        return JSONResponse(
+            {
+                "status": "ok" if ok else "degraded",
+                "checks": checks,
+            },
+            status_code=200 if ok else 503,
+        )
+
     @app.get("/metrics")
     async def metrics() -> JSONResponse:
         monitor_state = getattr(app.state, "instance_monitor", {}) or {}
         snap = monitor_state.get("last_snapshot") or {}
+        ready_ok, readiness_checks = await _readiness_snapshot(app)
+        runtime = app.state.runtime_metrics
         # Prometheus-style text is nice, but JSON is friendlier for early stages.
         return JSONResponse(
             {
                 "status": "ok",
+                "release": runtime["release"],
+                "readiness": {
+                    "status": "ok" if ready_ok else "degraded",
+                    "checks": readiness_checks,
+                },
+                "runtime": {
+                    "requests": runtime["requests"],
+                    "lastError": runtime["lastError"],
+                },
                 "spawns": {
                     "attempts": health_metrics.spawn_attempts.value,
                     "success": health_metrics.spawn_success.value,
@@ -475,11 +736,28 @@ def create_app() -> FastAPI:
         return templates.TemplateResponse(request, "landing.html", {})
 
     @app.post("/api/signup")
-    async def signup(submission: SignupSubmission) -> JSONResponse:
-        user = await app.state.registry.create_user(
-            name=submission.name,
-            timezone=submission.timezone or "UTC",
-        )
+    async def signup(request: Request, submission: SignupSubmission) -> JSONResponse:
+        try:
+            user = await app.state.registry.create_user(
+                name=submission.name,
+                timezone=submission.timezone or "UTC",
+            )
+        except Exception as exc:
+            request.state.error_logged = True
+            _log_request_error(
+                request,
+                status_code=502,
+                detail="Unable to create setup session right now.",
+                event="signup.failed",
+                exc=exc,
+            )
+            _record_runtime_error(
+                request.app,
+                request=request,
+                status_code=502,
+                detail="Unable to create setup session right now.",
+            )
+            raise HTTPException(status_code=502, detail="Unable to create setup session right now.") from exc
         # Create a per-user staging workspace keyed by the registry setup token.
         health = _health_for_setup_token(app, user.setup_token)
         health.create_setup_session_with_token(user.setup_token)
@@ -623,7 +901,7 @@ def create_app() -> FastAPI:
         return JSONResponse({"status": "ok", "setup": updated})
 
     @app.post("/api/setup/{setup_token}/activate")
-    async def setup_activate(setup_token: str) -> JSONResponse:
+    async def setup_activate(request: Request, setup_token: str) -> JSONResponse:
         health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
@@ -634,8 +912,6 @@ def create_app() -> FastAPI:
             fallback_links=app.state.channel_links,
             bridge_snapshot=monitor.snapshot,
         )
-        # Hosted: provider is injected by the service (MiniMax) so the UI doesn't ask for it.
-        provider_ok = True
         if not any(
             bool(item.get("connected"))
             for item in payload["channels"].values()
@@ -664,6 +940,20 @@ def create_app() -> FastAPI:
                 )
                 await redis.enqueue_job("spawn_instance_job", setup_token)
             except Exception as exc:
+                request.state.error_logged = True
+                _log_request_error(
+                    request,
+                    status_code=502,
+                    detail=f"Unable to queue provisioning: {exc}",
+                    event="activate.queue_failed",
+                    exc=exc,
+                )
+                _record_runtime_error(
+                    request.app,
+                    request=request,
+                    status_code=502,
+                    detail=f"Unable to queue provisioning: {exc}",
+                )
                 raise HTTPException(status_code=502, detail=f"Unable to queue provisioning: {exc}") from exc
             return JSONResponse({"status": "ok", "state": "provisioning"})
 
@@ -711,9 +1001,21 @@ def create_app() -> FastAPI:
             )
             health_metrics.spawn_success.inc()
         except Exception as exc:
-            import traceback
-            traceback.print_exc()
             health_metrics.spawn_failures.inc()
+            request.state.error_logged = True
+            _log_request_error(
+                request,
+                status_code=502,
+                detail=f"Unable to spawn coach container: {exc}",
+                event="activate.spawn_failed",
+                exc=exc,
+            )
+            _record_runtime_error(
+                request.app,
+                request=request,
+                status_code=502,
+                detail=f"Unable to spawn coach container: {exc}",
+            )
             warnings.append(f"Unable to spawn coach container: {exc}")
         if not spawn:
             raise HTTPException(
@@ -767,6 +1069,7 @@ def create_app() -> FastAPI:
                     "restartFailures": monitor_state.get("restart_failures"),
                     "lastError": monitor_state.get("last_error", ""),
                 },
+                "runtime": app.state.runtime_metrics,
             }
         )
 

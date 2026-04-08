@@ -133,9 +133,9 @@ class HealthRegistry:
                     name.strip(),
                     timezone.strip(),
                     setup_token,
-                    created_at,
                     tier,
                     "setup",
+                    created_at,
                 )
         else:
             async with aiosqlite.connect(self.path) as db:
@@ -320,4 +320,3 @@ class HealthRegistry:
                 """
             )
             return [dict(row) for row in rows]
-

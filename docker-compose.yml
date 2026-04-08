@@ -10,6 +10,8 @@ x-common-config: &common-config
     MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
     HEALTH_VAULT_KEY: ${HEALTH_VAULT_KEY:-}
     HEALTH_ONBOARDING_BASE_URL: ${HEALTH_ONBOARDING_BASE_URL:-}
+    APP_RELEASE: ${APP_RELEASE:-}
+    APP_DEPLOYED_AT: ${APP_DEPLOYED_AT:-}
   cap_drop:
     - ALL
   cap_add:
