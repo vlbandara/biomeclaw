@@ -111,7 +111,7 @@ if (( ${#FAILURES[@]} > 0 )); then
   STATUS="failed"
 fi
 
-python - "${OUT_DIR}" "${BASE_URL}" "${STATUS}" "${HOST}" "${APP_DIR}" "${LOG_SINCE}" "${FAILURES[@]}" <<'PY'
+python3 - "${OUT_DIR}" "${BASE_URL}" "${STATUS}" "${HOST}" "${APP_DIR}" "${LOG_SINCE}" "${FAILURES[@]}" <<'PY'
 import json
 import sys
 from datetime import datetime, timezone
