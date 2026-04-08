@@ -13,6 +13,8 @@ USER_NAME="${PROD_USER:-root}"
 APP_DIR="${PROD_APP_DIR:-/opt/biomeclaw}"
 LOG_SINCE="${LOG_SINCE:-15m}"
 OUT_DIR=""
+RETRIES="${SMOKE_RETRIES:-20}"
+SLEEP_SECONDS="${SMOKE_SLEEP_SECONDS:-3}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -40,6 +42,14 @@ while [[ $# -gt 0 ]]; do
       OUT_DIR="$2"
       shift 2
       ;;
+    --retries)
+      RETRIES="$2"
+      shift 2
+      ;;
+    --sleep-seconds)
+      SLEEP_SECONDS="$2"
+      shift 2
+      ;;
     *)
       prod_die "Unknown argument: $1"
       ;;
@@ -61,7 +71,18 @@ for endpoint in "${ENDPOINTS[@]}"; do
   headers_path="${OUT_DIR}/endpoints/${safe_name}.headers"
   body_path="${OUT_DIR}/endpoints/${safe_name}.body"
   url="${BASE_URL%/}/${endpoint}"
-  http_code="$(curl -sS -X GET -H 'Accept: application/json' -D "${headers_path}" -o "${body_path}" -w '%{http_code}' "${url}" || true)"
+  http_code=""
+  attempt=1
+  while (( attempt <= RETRIES )); do
+    http_code="$(curl -sS -X GET -H 'Accept: application/json' -D "${headers_path}" -o "${body_path}" -w '%{http_code}' "${url}" || true)"
+    if [[ "${http_code}" =~ ^2 ]]; then
+      break
+    fi
+    if (( attempt < RETRIES )); then
+      sleep "${SLEEP_SECONDS}"
+    fi
+    attempt=$((attempt + 1))
+  done
   if [[ ! "${http_code}" =~ ^2 ]]; then
     FAILURES+=("endpoint:${endpoint}:http_${http_code}")
   fi

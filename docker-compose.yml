@@ -6,7 +6,7 @@ x-common-config: &common-config
     dockerfile: Dockerfile
   volumes:
     - ~/.nanobot:/home/nanobot/.nanobot
-  environment:
+  environment: &common-env
     MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
     HEALTH_VAULT_KEY: ${HEALTH_VAULT_KEY:-}
     HEALTH_ONBOARDING_BASE_URL: ${HEALTH_ONBOARDING_BASE_URL:-}
@@ -63,6 +63,7 @@ services:
       - ~/.nanobot:/home/nanobot/.nanobot
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      <<: *common-env
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       HEALTH_VAULT_KEY: ${HEALTH_VAULT_KEY:-}
       HEALTH_ONBOARDING_BASE_URL: ${HEALTH_ONBOARDING_BASE_URL:-}
@@ -116,6 +117,7 @@ services:
       - ~/.nanobot:/home/nanobot/.nanobot
       - /var/run/docker.sock:/var/run/docker.sock
     environment:
+      <<: *common-env
       MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
       HEALTH_VAULT_KEY: ${HEALTH_VAULT_KEY:-}
       HEALTH_ONBOARDING_BASE_URL: ${HEALTH_ONBOARDING_BASE_URL:-}
