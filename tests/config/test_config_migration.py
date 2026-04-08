@@ -1,9 +1,12 @@
 import json
 import socket
+from pathlib import Path
 from unittest.mock import patch
 
-from nanobot.config.loader import load_config, save_config
+from nanobot.config.loader import _apply_health_runtime_overrides, load_config, save_config
+from nanobot.config.schema import Config
 from nanobot.health.storage import HealthWorkspace
+from nanobot.providers.factory import _apply_health_runtime_overrides as _apply_provider_overrides
 from nanobot.security.network import validate_url_target
 
 
@@ -193,6 +196,53 @@ def test_load_config_applies_active_hosted_health_overrides(tmp_path, monkeypatc
     assert config.providers.minimax.api_key == "minimax-live-key"
     assert config.channels.telegram["enabled"] is True
     assert config.channels.telegram["token"] == "123:abc"
+
+
+def test_health_runtime_overrides_do_not_clamp_temperature(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HEALTH_VAULT_KEY", "test-health-vault-key")
+    workspace = tmp_path / "workspace"
+    workspace.mkdir(parents=True)
+
+    health = HealthWorkspace(workspace)
+    health.create_setup_session()
+    health.store_provider_secret(
+        provider_name="minimax",
+        model="MiniMax-M2.7",
+        api_key="minimax-live-key",
+        secret="test-health-vault-key",
+    )
+    health.store_telegram_secret(
+        bot_token="123:abc",
+        bot_id=123,
+        bot_username="healthbot_test",
+        secret="test-health-vault-key",
+    )
+    health.mark_setup_active()
+
+    config = Config.model_validate(
+        {
+            "agents": {
+                "defaults": {
+                    "workspace": str(workspace),
+                    "provider": "minimax",
+                    "model": "MiniMax-M2.7",
+                    "temperature": 0.8,
+                }
+            }
+        }
+    )
+
+    _apply_health_runtime_overrides(config)
+    provider_config = _apply_provider_overrides(config, workspace)
+
+    assert config.agents.defaults.temperature == 0.8
+    assert provider_config.agents.defaults.temperature == 0.8
+
+
+def test_health_instance_config_template_uses_livelier_temperature() -> None:
+    config_path = Path("nanobot/health/config_template.json")
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    assert config["agents"]["defaults"]["temperature"] == 0.55
 
 
 def test_load_config_applies_active_hosted_openrouter_overrides(tmp_path, monkeypatch) -> None:

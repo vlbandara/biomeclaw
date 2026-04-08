@@ -2,8 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 import os
+import time
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -27,6 +31,7 @@ from nanobot.health.hosted import (
     validate_telegram_bot_token,
 )
 from nanobot.health.storage import HealthWorkspace, get_health_vault_secret
+from nanobot.health import metrics as health_metrics
 
 
 class SignupSubmission(BaseModel):
@@ -216,12 +221,159 @@ def _setup_status_payload(
     }
 
 
+def _env_int(name: str, default: int) -> int:
+    raw = os.environ.get(name, "").strip()
+    if not raw:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+class _JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:  # noqa: A003
+        payload = {
+            "level": record.levelname,
+            "logger": record.name,
+            "message": record.getMessage(),
+            "time": self.formatTime(record, datefmt="%Y-%m-%dT%H:%M:%S%z"),
+        }
+        if record.exc_info:
+            payload["exc_info"] = self.formatException(record.exc_info)
+        try:
+            return json.dumps(payload, ensure_ascii=False)
+        except Exception:
+            return f'{{"level":"{record.levelname}","message":"{record.getMessage()}"}}'
+
+
+def _configure_logging() -> None:
+    if os.environ.get("NANOBOT_JSON_LOGS", "1").strip().lower() not in {"1", "true", "yes", "on"}:
+        return
+    root = logging.getLogger()
+    if any(isinstance(h.formatter, _JsonFormatter) for h in root.handlers if getattr(h, "formatter", None)):
+        return
+    handler = logging.StreamHandler()
+    handler.setFormatter(_JsonFormatter())
+    root.handlers = [handler]
+    root.setLevel(os.environ.get("LOG_LEVEL", "INFO").upper())
+
+
+async def _container_health_monitor(app: FastAPI) -> None:
+    """Best-effort monitor that restarts exited/dead managed containers."""
+    interval_s = max(2, _env_int("NANOBOT_HEALTH_MONITOR_INTERVAL_SECONDS", 10))
+    app.state.instance_monitor = {
+        "started_at": time.time(),
+        "interval_seconds": interval_s,
+        "restart_attempts": 0,
+        "restart_success": 0,
+        "restart_failures": 0,
+        "last_run_at": None,
+        "last_error": "",
+        "last_snapshot": {},
+    }
+    while True:
+        try:
+            now = time.time()
+            restarted: list[dict[str, Any]] = []
+            unhealthy: list[dict[str, Any]] = []
+            containers = app.state.spawner.list_instances(all=True)
+            health_metrics.instance_total.set(len(containers))
+            for c in containers:
+                try:
+                    if not hasattr(c, "restart"):
+                        # In Swarm mode list_instances returns Service objects; Swarm handles restarts.
+                        continue
+                    c.reload()
+                    state = (getattr(c, "attrs", {}) or {}).get("State", {}) or {}
+                    status = str(state.get("Status") or getattr(c, "status", "") or "")
+                    name = ""
+                    try:
+                        name = str((getattr(c, "name", "") or "")).lstrip("/")
+                    except Exception:
+                        name = ""
+                    container_id = str(getattr(c, "id", "") or "")
+                    if status not in {"running"}:
+                        unhealthy.append(
+                            {"id": container_id, "name": name, "status": status}
+                        )
+                        app.state.instance_monitor["restart_attempts"] += 1
+                        try:
+                            c.restart()
+                            app.state.instance_monitor["restart_success"] += 1
+                            restarted.append(
+                                {"id": container_id, "name": name, "from": status, "to": "running"}
+                            )
+                        except Exception as exc:
+                            app.state.instance_monitor["restart_failures"] += 1
+                            unhealthy[-1]["restart_error"] = str(exc)
+                except Exception:
+                    # Don't let a single container break the loop.
+                    continue
+            app.state.instance_monitor["last_run_at"] = now
+            app.state.instance_monitor["last_error"] = ""
+            app.state.instance_monitor["last_snapshot"] = {
+                "running": app.state.spawner.count_running_instances(),
+                "total": len(containers),
+                "unhealthy": unhealthy,
+                "restarted": restarted,
+            }
+            health_metrics.instance_running.set(int(app.state.instance_monitor["last_snapshot"]["running"]))
+
+            # Idle shutdown (best-effort) based on registry last_active timestamps.
+            idle_s = _env_int("NANOBOT_HEALTH_IDLE_SHUTDOWN_SECONDS", 0)
+            if idle_s > 0:
+                try:
+                    users = await app.state.registry.list_users()
+                    cutoff = datetime.now(UTC) - timedelta(seconds=idle_s)
+                    stopped: list[dict[str, Any]] = []
+                    for u in users:
+                        if (u.get("status") or "") != "active":
+                            continue
+                        instance_id = str(u.get("container_id") or "")
+                        if not instance_id:
+                            continue
+                        last_active_raw = u.get("last_active") or ""
+                        try:
+                            last_active = datetime.fromisoformat(str(last_active_raw)).astimezone(UTC)
+                        except Exception:
+                            continue
+                        if last_active < cutoff:
+                            app.state.spawner.stop_instance(instance_id)
+                            stopped.append({"userId": u.get("id"), "instanceId": instance_id})
+                    if stopped:
+                        app.state.instance_monitor["last_snapshot"]["stoppedIdle"] = stopped
+                except Exception:
+                    pass
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            app.state.instance_monitor["last_error"] = str(exc)
+        await asyncio.sleep(interval_s)
+
+
+def _staging_root(workspace_root: Path) -> Path:
+    return workspace_root / "health-staging"
+
+
+def _health_for_setup_token(app: FastAPI, setup_token: str) -> HealthWorkspace:
+    root = _staging_root(app.state.workspace_root)
+    root.mkdir(parents=True, exist_ok=True)
+    session_dir = root / setup_token
+    session_dir.mkdir(parents=True, exist_ok=True)
+    return HealthWorkspace(session_dir)
+
+
+def _global_health(app: FastAPI) -> HealthWorkspace:
+    # Shared workspace state (invites, shared onboarding, etc.)
+    return HealthWorkspace(app.state.workspace_root)
+
+
 def create_app() -> FastAPI:
-    workspace = _resolve_workspace()
-    health = HealthWorkspace(workspace)
+    _configure_logging()
+    workspace_root = _resolve_workspace()
     app = FastAPI(title="nanobot health onboarding")
-    app.state.workspace = workspace
-    app.state.health = health
+    app.state.workspace_root = workspace_root
     app.state.health_secret = get_health_vault_secret()
     app.state.channel_links = _channel_links()
     app.state.registry = HealthRegistry()
@@ -231,12 +383,7 @@ def create_app() -> FastAPI:
         bridge_url=get_whatsapp_bridge_url(),
         bridge_token=get_whatsapp_bridge_token(),
         fallback_chat_url=app.state.channel_links.get("whatsapp", ""),
-        on_status=lambda payload: health.update_whatsapp_status(
-            status=str(payload.get("status") or "waiting"),
-            jid=str(payload.get("jid") or ""),
-            phone=str(payload.get("phone") or ""),
-            chat_url=str(payload.get("chat_url") or ""),
-        ),
+        on_status=lambda _payload: None,
     )
     app.state.whatsapp_monitor = monitor
 
@@ -249,14 +396,46 @@ def create_app() -> FastAPI:
     @app.on_event("startup")
     async def startup() -> None:
         await monitor.start()
+        app.state.instance_monitor_task = asyncio.create_task(_container_health_monitor(app))
 
     @app.on_event("shutdown")
     async def shutdown() -> None:
         await monitor.stop()
+        task = getattr(app.state, "instance_monitor_task", None)
+        if task is not None:
+            task.cancel()
+            try:
+                await task
+            except Exception:
+                pass
 
     @app.get("/healthz")
     async def healthz() -> dict[str, str]:
         return {"status": "ok"}
+
+    @app.get("/metrics")
+    async def metrics() -> JSONResponse:
+        monitor_state = getattr(app.state, "instance_monitor", {}) or {}
+        snap = monitor_state.get("last_snapshot") or {}
+        # Prometheus-style text is nice, but JSON is friendlier for early stages.
+        return JSONResponse(
+            {
+                "status": "ok",
+                "spawns": {
+                    "attempts": health_metrics.spawn_attempts.value,
+                    "success": health_metrics.spawn_success.value,
+                    "failures": health_metrics.spawn_failures.value,
+                },
+                "instances": {
+                    "running": health_metrics.instance_running.value,
+                    "total": health_metrics.instance_total.value,
+                    "unhealthy": len(snap.get("unhealthy") or []),
+                    "restartAttempts": monitor_state.get("restart_attempts", 0),
+                    "restartSuccess": monitor_state.get("restart_success", 0),
+                    "restartFailures": monitor_state.get("restart_failures", 0),
+                },
+            }
+        )
 
     @app.get("/", response_class=HTMLResponse)
     async def landing(request: Request) -> HTMLResponse:
@@ -268,13 +447,14 @@ def create_app() -> FastAPI:
             name=submission.name,
             timezone=submission.timezone or "UTC",
         )
-        # For now, reuse the existing single-workspace setup session storage.
-        # The next iteration will map setup tokens to per-user staging workspaces.
-        token, _setup = health.get_or_create_setup_session()
-        return JSONResponse({"status": "ok", "setupToken": token, "userId": user.id})
+        # Create a per-user staging workspace keyed by the registry setup token.
+        health = _health_for_setup_token(app, user.setup_token)
+        health.create_setup_session_with_token(user.setup_token)
+        return JSONResponse({"status": "ok", "setupToken": user.setup_token, "userId": user.id})
 
     @app.get("/setup/{setup_token}", response_class=HTMLResponse)
     async def setup_form(request: Request, setup_token: str) -> HTMLResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -291,6 +471,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/setup/{setup_token}/status")
     async def setup_status(setup_token: str) -> JSONResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -304,6 +485,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/setup/{setup_token}/provider")
     async def setup_provider(setup_token: str, submission: ProviderSetupSubmission) -> JSONResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -330,6 +512,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/setup/{setup_token}/channels/telegram")
     async def setup_telegram(setup_token: str, submission: TelegramSetupSubmission) -> JSONResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -355,6 +538,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/setup/{setup_token}/channels/whatsapp/qr")
     async def setup_whatsapp_qr(setup_token: str) -> JSONResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -374,6 +558,7 @@ def create_app() -> FastAPI:
 
     @app.get("/api/setup/{setup_token}/channels/whatsapp/status")
     async def setup_whatsapp_status(setup_token: str) -> JSONResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -386,6 +571,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/setup/{setup_token}/profile")
     async def setup_profile(setup_token: str, submission: OnboardingSubmission) -> JSONResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -397,6 +583,7 @@ def create_app() -> FastAPI:
 
     @app.post("/api/setup/{setup_token}/activate")
     async def setup_activate(setup_token: str) -> JSONResponse:
+        health = _health_for_setup_token(app, setup_token)
         setup = health.validate_setup_token(setup_token)
         if not setup:
             raise HTTPException(status_code=404, detail="Setup session not found or expired.")
@@ -426,8 +613,21 @@ def create_app() -> FastAPI:
         if not telegram_token:
             raise HTTPException(status_code=400, detail="Paste your Telegram bot token first.")
 
+        if os.environ.get("NANOBOT_HEALTH_ASYNC_SPAWN", "").strip().lower() in {"1", "true", "yes", "on"}:
+            try:
+                from arq import create_pool
+                from arq.connections import RedisSettings
+
+                redis = await create_pool(
+                    RedisSettings.from_dsn(os.environ.get("ARQ_REDIS_URL", "redis://redis:6379/0"))
+                )
+                await redis.enqueue_job("spawn_instance_job", setup_token)
+            except Exception as exc:
+                raise HTTPException(status_code=502, detail=f"Unable to queue provisioning: {exc}") from exc
+            return JSONResponse({"status": "ok", "state": "provisioning"})
+
         profile = persist_health_onboarding(
-            workspace,
+            app.state.workspace_root,
             submission,
             invite=None,
             secret=app.state.health_secret,
@@ -453,10 +653,14 @@ def create_app() -> FastAPI:
         if not minimax_api_key:
             warnings.append("MINIMAX_API_KEY is not set; the coach may not be able to reply.")
         try:
+            health_metrics.spawn_attempts.inc()
+            record = await app.state.registry.get_by_setup_token(setup_token)
+            tier = (record.tier if record else "standard") if record else "standard"
             spawn = app.state.spawner.spawn_instance(
                 user_id=setup_token,
                 config_json=config_json,
                 onboarding_submission=submission,
+                tier=tier,
                 extra_env={
                     "MINIMAX_API_KEY": minimax_api_key,
                     "TELEGRAM_BOT_TOKEN": telegram_token,
@@ -464,9 +668,11 @@ def create_app() -> FastAPI:
                     or app.state.health_secret,
                 },
             )
+            health_metrics.spawn_success.inc()
         except Exception as exc:
             import traceback
             traceback.print_exc()
+            health_metrics.spawn_failures.inc()
             warnings.append(f"Unable to spawn coach container: {exc}")
         if not spawn:
             raise HTTPException(
@@ -475,8 +681,9 @@ def create_app() -> FastAPI:
             )
 
         try:
+            registry_user_id = record.id if record else setup_token
             await app.state.registry.set_container(
-                user_id=setup_token,
+                user_id=registry_user_id,
                 container_id=spawn.container_id,
                 workspace_volume=spawn.volume_name,
                 status="active",
@@ -504,10 +711,38 @@ def create_app() -> FastAPI:
     @app.get("/api/admin/status")
     async def admin_status() -> JSONResponse:
         users = await app.state.registry.list_users()
-        return JSONResponse({"status": "ok", "users": users})
+        monitor_state = getattr(app.state, "instance_monitor", {}) or {}
+        return JSONResponse(
+            {
+                "status": "ok",
+                "users": users,
+                "instances": monitor_state.get("last_snapshot") or {},
+                "instanceMonitor": {
+                    "startedAt": monitor_state.get("started_at"),
+                    "intervalSeconds": monitor_state.get("interval_seconds"),
+                    "lastRunAt": monitor_state.get("last_run_at"),
+                    "restartAttempts": monitor_state.get("restart_attempts"),
+                    "restartSuccess": monitor_state.get("restart_success"),
+                    "restartFailures": monitor_state.get("restart_failures"),
+                    "lastError": monitor_state.get("last_error", ""),
+                },
+            }
+        )
+
+    @app.post("/api/instance/{setup_token}/ping")
+    async def instance_ping(setup_token: str) -> JSONResponse:
+        record = await app.state.registry.get_by_setup_token(setup_token)
+        if not record:
+            raise HTTPException(status_code=404, detail="Unknown setup token.")
+        try:
+            await app.state.registry.update_last_active(record.id)
+        except Exception:
+            pass
+        return JSONResponse({"status": "ok"})
 
     @app.get("/onboard/{invite}", response_class=HTMLResponse)
     async def onboard_form(request: Request, invite: str) -> HTMLResponse:
+        health = _global_health(app)
         invite_meta = health.validate_invite(invite)
         if not invite_meta:
             raise HTTPException(status_code=404, detail="Invite not found, expired, or already used.")
@@ -524,12 +759,13 @@ def create_app() -> FastAPI:
 
     @app.post("/api/onboard/{invite}/submit")
     async def onboard_submit(invite: str, submission: OnboardingSubmission) -> JSONResponse:
+        health = _global_health(app)
         invite_meta = health.validate_invite(invite)
         if not invite_meta:
             raise HTTPException(status_code=404, detail="Invite not found, expired, or already used.")
         payload = submission.model_dump()
         profile = persist_health_onboarding(
-            workspace,
+            app.state.workspace_root,
             payload,
             invite=invite_meta,
             secret=app.state.health_secret,

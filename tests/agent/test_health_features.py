@@ -9,15 +9,40 @@ import pytest
 
 from nanobot.agent.loop import AgentLoop
 from nanobot.agent.memory import Dream, MemoryStore
+from nanobot.agent.tools.health_profile import SetPreferredNameTool
 from nanobot.bus.queue import MessageBus
 from nanobot.cli.commands import _pick_routable_heartbeat_target
+from nanobot.health.bootstrap import persist_health_onboarding, write_health_workspace_assets
 from nanobot.health.storage import HealthWorkspace
 from nanobot.session.manager import SessionManager
 
 
+def _health_profile(preferred_channel: str = "whatsapp") -> dict:
+    return {
+        "mode": "health",
+        "preferred_channel": preferred_channel,
+        "timezone": "UTC",
+        "language": "en",
+        "demographics": {},
+        "routines": {},
+        "screenings": {},
+        "wellbeing": {},
+        "goals": ["stay consistent"],
+        "current_concerns": "",
+        "preferences": {
+            "morning_check_in": True,
+            "reminder_preferences": [],
+            "medication_reminder_windows": [],
+            "weekly_summary": True,
+        },
+    }
+
+
 def _enable_health(workspace: Path) -> None:
     health = HealthWorkspace(workspace)
-    health.save_profile({"mode": "health", "preferred_channel": "whatsapp"})
+    profile = _health_profile()
+    health.save_profile(profile)
+    write_health_workspace_assets(workspace, profile)
 
 
 @pytest.mark.asyncio
@@ -144,3 +169,156 @@ async def test_first_health_message_prefers_hosted_setup_url(
     assert "finish setting up your health assistant" in response.content
     assert "https://health.example.com/setup/" in response.content
     provider.chat_with_retry.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_health_cold_start_injects_opening_policy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _enable_health(tmp_path)
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation.max_tokens = 4096
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path)
+    captured: list[list[dict]] = []
+
+    async def fake_run(initial_messages, *args, **kwargs):
+        captured.append(initial_messages)
+        return "fine", [], initial_messages + [{"role": "assistant", "content": "fine"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", fake_run)
+
+    await loop.process_direct("hey", channel="telegram", chat_id="123")
+
+    system_prompt = captured[0][0]["content"]
+    assert "Health Cold Start" in system_prompt
+    assert "feel alive or generic" in system_prompt
+
+
+@pytest.mark.asyncio
+async def test_health_cold_start_turns_off_after_substantive_history(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _enable_health(tmp_path)
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation.max_tokens = 4096
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path)
+    captured: list[list[dict]] = []
+
+    async def fake_run(initial_messages, *args, **kwargs):
+        captured.append(initial_messages)
+        return "fine", [], initial_messages + [{"role": "assistant", "content": "fine"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", fake_run)
+
+    await loop.process_direct(
+        "I slept badly, skipped the gym, and I need a reset.",
+        session_key="telegram:123",
+        channel="telegram",
+        chat_id="123",
+    )
+    await loop.process_direct(
+        "What now?",
+        session_key="telegram:123",
+        channel="telegram",
+        chat_id="123",
+    )
+
+    assert "Health Cold Start" in captured[0][0]["content"]
+    assert "Health Cold Start" not in captured[1][0]["content"]
+
+
+@pytest.mark.asyncio
+async def test_onboarding_seeds_preferred_name_and_runtime_context(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEALTH_VAULT_KEY", "test-health-vault-key")
+    persist_health_onboarding(
+        tmp_path,
+        {
+            "phase1": {
+                "full_name": "Jane Doe",
+                "email": "",
+                "phone": "",
+                "timezone": "UTC",
+                "language": "en",
+                "preferred_channel": "telegram",
+                "age_range": "not set",
+                "sex": "not set",
+                "gender": "not set",
+                "height_cm": None,
+                "weight_kg": None,
+                "known_conditions": [],
+                "medications": [],
+                "allergies": [],
+                "wake_time": "",
+                "sleep_time": "",
+                "consents": ["privacy"],
+            },
+            "phase2": {
+                "mood_interest": 0,
+                "mood_down": 0,
+                "activity_level": "not set",
+                "nutrition_quality": "not set",
+                "sleep_quality": "not set",
+                "stress_level": "not set",
+                "goals": ["Gym consistency"],
+                "current_concerns": "",
+                "reminder_preferences": [],
+                "medication_reminder_windows": [],
+                "morning_check_in": True,
+                "weekly_summary": True,
+            },
+        },
+        invite={"channel": "telegram", "chat_id": "123"},
+        secret="test-health-vault-key",
+    )
+
+    provider = MagicMock()
+    provider.get_default_model.return_value = "test-model"
+    provider.generation.max_tokens = 4096
+
+    loop = AgentLoop(bus=MessageBus(), provider=provider, workspace=tmp_path)
+    captured: list[list[dict]] = []
+
+    async def fake_run(initial_messages, *args, **kwargs):
+        captured.append(initial_messages)
+        return "fine", [], initial_messages + [{"role": "assistant", "content": "fine"}]
+
+    monkeypatch.setattr(loop, "_run_agent_loop", fake_run)
+
+    await loop.process_direct("hey", session_key="telegram:123", channel="telegram", chat_id="123")
+
+    health = HealthWorkspace(tmp_path)
+    assert health.load_preferred_name(secret="test-health-vault-key") == "Jane"
+    assert "Jane Doe" not in (tmp_path / "USER.md").read_text(encoding="utf-8")
+    assert "Jane" not in (tmp_path / "memory" / "MEMORY.md").read_text(encoding="utf-8")
+    assert "Preferred Name: Jane" in captured[0][-1]["content"]
+
+
+@pytest.mark.asyncio
+async def test_set_preferred_name_tool_persists_alias(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("HEALTH_VAULT_KEY", "test-health-vault-key")
+    _enable_health(tmp_path)
+    health = HealthWorkspace(tmp_path)
+    health.save_vault(
+        {
+            "identifiers": {"person_names": []},
+            "contact": {"full_name": ""},
+        },
+        secret="test-health-vault-key",
+    )
+
+    tool = SetPreferredNameTool(tmp_path)
+    result = await tool.execute(preferred_name="Vin")
+
+    vault = health.load_vault(secret="test-health-vault-key")
+    assert result == "Saved preferred name: Vin"
+    assert health.load_preferred_name(secret="test-health-vault-key") == "Vin"
+    assert "Vin" in vault["identifiers"]["person_names"]

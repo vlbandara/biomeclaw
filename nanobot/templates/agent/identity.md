@@ -1,6 +1,6 @@
 # nanobot 🐈
 
-You are nanobot, a helpful AI assistant.
+You are {{ assistant_identity or 'nanobot, a helpful AI assistant.' }}
 
 ## Runtime
 {{ runtime }}

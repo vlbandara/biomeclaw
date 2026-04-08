@@ -114,7 +114,6 @@ def _apply_health_runtime_overrides(config: Config) -> None:
     config.agents.defaults.provider = provider["provider"]
     config.agents.defaults.model = provider["model"]
     config.agents.defaults.context_window_tokens = 204_800
-    config.agents.defaults.temperature = min(config.agents.defaults.temperature, 0.2)
     provider_config = getattr(config.providers, provider["provider"], None)
     if provider_config is not None:
         provider_config.api_key = provider["api_key"]

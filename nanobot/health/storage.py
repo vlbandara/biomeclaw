@@ -24,10 +24,39 @@ _DEFAULT_INVITE_TTL_HOURS = 24
 _DEFAULT_SETUP_TTL_HOURS = 24 * 7
 _DEFAULT_HOSTED_PROVIDER = "minimax"
 _DEFAULT_HOSTED_MODEL = "MiniMax-M2.7"
+_PREFERRED_NAME_MAX_LEN = 40
 
 
 def _clean_list(values: list[str] | None) -> list[str]:
     return [value.strip() for value in values or [] if value and value.strip()]
+
+
+def derive_preferred_name(full_name: str) -> str:
+    cleaned = " ".join(str(full_name or "").strip().split())
+    if not cleaned:
+        return ""
+
+    honorifics = {
+        "mr",
+        "mrs",
+        "ms",
+        "miss",
+        "dr",
+        "prof",
+        "sir",
+        "madam",
+        "coach",
+    }
+    tokens = [part for part in cleaned.split(" ") if part]
+    while tokens and tokens[0].rstrip(".").lower() in honorifics:
+        tokens.pop(0)
+    candidate = (tokens[0] if tokens else cleaned).strip(",.;:!?")
+    return candidate[:_PREFERRED_NAME_MAX_LEN]
+
+
+def normalize_preferred_name(value: str) -> str:
+    cleaned = " ".join(str(value or "").strip().split())
+    return cleaned[:_PREFERRED_NAME_MAX_LEN]
 
 
 def _default_setup_payload(token: str, *, ttl_hours: int) -> dict[str, Any]:
@@ -221,6 +250,32 @@ class HealthWorkspace:
         encrypted = encrypt_json(vault, secret=secret)
         self.vault_path.write_text(encrypted + "\n", encoding="utf-8")
 
+    def load_preferred_name(self, *, secret: str | None = None) -> str:
+        vault = self.load_vault(secret=secret) or {}
+        contact = vault.get("contact") or {}
+        preferred = normalize_preferred_name(contact.get("preferred_name", ""))
+        if preferred:
+            return preferred
+        return derive_preferred_name(contact.get("full_name", ""))
+
+    def save_preferred_name(self, preferred_name: str, *, secret: str | None = None) -> str:
+        cleaned = normalize_preferred_name(preferred_name)
+        if not cleaned:
+            raise ValueError("Preferred name cannot be empty.")
+
+        vault = self.load_vault(secret=secret) or {}
+        contact = vault.setdefault("contact", {})
+        identifiers = vault.setdefault("identifiers", {})
+        person_names = _clean_list(identifiers.get("person_names"))
+
+        if cleaned.lower() not in {value.lower() for value in person_names}:
+            person_names.append(cleaned)
+            identifiers["person_names"] = person_names
+
+        contact["preferred_name"] = cleaned
+        self.save_vault(vault, secret=secret)
+        return cleaned
+
     def load_setup(self) -> dict[str, Any] | None:
         if not self.setup_path.exists():
             return None
@@ -352,6 +407,19 @@ class HealthWorkspace:
         self.save_setup(setup)
         return token, setup
 
+    def create_setup_session_with_token(
+        self,
+        token: str,
+        *,
+        ttl_hours: int = _DEFAULT_SETUP_TTL_HOURS,
+    ) -> tuple[str, dict[str, Any]]:
+        cleaned = (token or "").strip()
+        if not cleaned:
+            raise ValueError("Setup token cannot be empty.")
+        setup = _default_setup_payload(cleaned, ttl_hours=ttl_hours)
+        self.save_setup(setup)
+        return cleaned, setup
+
     def validate_setup_token(self, token: str) -> dict[str, Any] | None:
         setup = self.load_setup()
         if not setup or setup.get("token") != token:
@@ -400,7 +468,10 @@ class HealthWorkspace:
         setup = self.load_setup()
         if not setup or setup.get("state") != "active":
             return None
-        secrets_payload = self.load_setup_secrets(secret=secret)
+        try:
+            secrets_payload = self.load_setup_secrets(secret=secret)
+        except Exception:
+            return None
         provider_key = secrets_payload.get("provider", {}).get("api_key", "").strip()
         telegram_token = secrets_payload.get("telegram", {}).get("bot_token", "").strip()
         channels = setup.get("channels", {})

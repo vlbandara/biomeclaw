@@ -6,7 +6,7 @@
       "model": "MiniMax-M2.7",
       "contextWindowTokens": 204800,
       "maxTokens": 4096,
-      "temperature": 0.2,
+      "temperature": 0.55,
       "providerRetryMode": "persistent",
       "dream": {
         "intervalH": 2,

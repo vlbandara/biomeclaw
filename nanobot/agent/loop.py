@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import time
 from contextlib import AsyncExitStack, nullcontext
 from pathlib import Path
@@ -21,6 +22,7 @@ from nanobot.agent.subagent import SubagentManager
 from nanobot.agent.tools.cron import CronTool
 from nanobot.agent.tools.filesystem import EditFileTool, ListDirTool, ReadFileTool, WriteFileTool
 from nanobot.agent.tools.health_onboarding import CompleteOnboardingTool
+from nanobot.agent.tools.health_profile import SetPreferredNameTool
 from nanobot.agent.tools.message import MessageTool
 from nanobot.agent.tools.registry import ToolRegistry
 from nanobot.agent.tools.search import GlobTool, GrepTool
@@ -164,6 +166,41 @@ class AgentLoop:
     """
 
     _RUNTIME_CHECKPOINT_KEY = "runtime_checkpoint"
+    _HEALTH_TRIVIAL_EXACT = {
+        "",
+        "hi",
+        "hey",
+        "hello",
+        "yo",
+        "sup",
+        "good",
+        "ok",
+        "okay",
+        "yes",
+        "no",
+        "me",
+        "me?",
+        "who are you",
+        "what do you know about me",
+        "what you know about me",
+    }
+    _HEALTH_TRIVIAL_PREFIXES = (
+        "hi ",
+        "hey ",
+        "hello ",
+        "what do you know about me",
+        "what you know about me",
+        "do you know me",
+        "you know me",
+        "do you know my name",
+        "do you want my name",
+        "do you wanna my name",
+        "my name is ",
+        "call me ",
+        "i'm ",
+        "im ",
+    )
+    _HEALTH_WORD_RE = re.compile(r"\s+")
 
     def __init__(
         self,
@@ -250,7 +287,7 @@ class AgentLoop:
             provider=provider,
             model=self.model,
             sessions=self.sessions,
-            context_window_tokens=context_window_tokens,
+            context_window_tokens=self.context_window_tokens,
             build_messages=self.context.build_messages,
             get_tool_definitions=self.tools.get_definitions,
             max_completion_tokens=provider.generation.max_tokens,
@@ -286,6 +323,8 @@ class AgentLoop:
             self.tools.register(WebFetchTool(proxy=self.web_config.proxy))
         self.tools.register(MessageTool(send_callback=self.bus.publish_outbound))
         self.tools.register(SpawnTool(manager=self.subagents))
+        if is_health_workspace(self.workspace):
+            self.tools.register(SetPreferredNameTool(self.workspace))
         if self.cron_service:
             self.tools.register(
                 CronTool(self.cron_service, default_timezone=self.context.timezone or "UTC")
@@ -338,6 +377,64 @@ class AgentLoop:
                 return tc.name
             return f'{tc.name}("{val[:40]}…")' if len(val) > 40 else f'{tc.name}("{val}")'
         return ", ".join(_fmt(tc) for tc in tool_calls)
+
+    @classmethod
+    def _normalize_health_user_text(cls, text: str) -> str:
+        cleaned = cls._HEALTH_WORD_RE.sub(" ", (text or "").strip().lower())
+        return cleaned.strip(" \t\r\n.,;:!?")
+
+    @classmethod
+    def _is_trivial_health_opening_text(cls, text: str) -> bool:
+        cleaned = cls._normalize_health_user_text(text)
+        if cleaned in cls._HEALTH_TRIVIAL_EXACT:
+            return True
+        if any(cleaned.startswith(prefix) for prefix in cls._HEALTH_TRIVIAL_PREFIXES):
+            return True
+        return len(cleaned) <= 4
+
+    def _is_health_cold_start(self, session: Session) -> bool:
+        if not is_health_workspace(self.workspace):
+            return False
+        history = session.get_history(max_messages=12)
+        user_history = [
+            str(message.get("content", ""))
+            for message in history
+            if message.get("role") == "user"
+        ]
+        if len(user_history) > 6:
+            return False
+        return not any(
+            not self._is_trivial_health_opening_text(text)
+            for text in user_history
+        )
+
+    def _health_runtime_context_extra(self) -> dict[str, str] | None:
+        if not is_health_workspace(self.workspace):
+            return None
+        try:
+            preferred_name = HealthWorkspace(self.workspace).load_preferred_name()
+        except Exception:
+            preferred_name = ""
+        if not preferred_name:
+            return None
+        return {"Preferred Name": preferred_name}
+
+    def _build_health_system_prompt(self, session: Session) -> str | None:
+        if not is_health_workspace(self.workspace) or not self._is_health_cold_start(session):
+            return None
+        preferred_name = ""
+        try:
+            preferred_name = HealthWorkspace(self.workspace).load_preferred_name()
+        except Exception:
+            preferred_name = ""
+        base_prompt = self.context.build_system_prompt()
+        cold_start_prompt = render_template(
+            "health/cold_start_system.md",
+            has_preferred_name=bool(preferred_name),
+            preferred_name=preferred_name,
+            strip=True,
+        )
+        return base_prompt + "\n\n---\n\n" + cold_start_prompt
 
     async def _run_agent_loop(
         self,
@@ -643,12 +740,15 @@ class AgentLoop:
             onboarding_prompt = (
                 render_template("health/onboarding_system.md", strip=True) if onboarding else None
             )
+            runtime_context_extra = self._health_runtime_context_extra()
+            system_prompt = onboarding_prompt or self._build_health_system_prompt(session)
             initial_messages = self.context.build_messages(
                 history=history,
                 current_message=msg.content,
                 media=msg.media if msg.media else None,
                 channel=msg.channel, chat_id=msg.chat_id,
-                system_prompt=onboarding_prompt,
+                system_prompt=system_prompt,
+                runtime_context_extra=runtime_context_extra,
             )
 
             async def _bus_progress(content: str, *, tool_hint: bool = False) -> None:

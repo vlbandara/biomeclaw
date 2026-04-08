@@ -8,6 +8,8 @@ from pathlib import Path
 import datetime as datetime_module
 
 from nanobot.agent.context import ContextBuilder
+from nanobot.health.bootstrap import write_health_workspace_assets
+from nanobot.health.storage import HealthWorkspace
 
 
 class _FakeDatetime(real_datetime):
@@ -100,3 +102,33 @@ def test_subagent_result_does_not_create_consecutive_assistant_messages(tmp_path
 
     for left, right in zip(messages, messages[1:]):
         assert not (left.get("role") == right.get("role") == "assistant")
+
+
+def test_health_system_prompt_uses_health_identity_and_agents(tmp_path) -> None:
+    workspace = _make_workspace(tmp_path)
+    profile = {
+        "mode": "health",
+        "preferred_channel": "telegram",
+        "timezone": "UTC",
+        "language": "en",
+        "demographics": {},
+        "routines": {},
+        "screenings": {},
+        "wellbeing": {},
+        "goals": ["build consistency"],
+        "current_concerns": "",
+        "preferences": {
+            "morning_check_in": True,
+            "reminder_preferences": [],
+            "medication_reminder_windows": [],
+            "weekly_summary": True,
+        },
+    }
+    HealthWorkspace(workspace).save_profile(profile)
+    write_health_workspace_assets(workspace, profile)
+
+    prompt = ContextBuilder(workspace).build_system_prompt()
+
+    assert "sharp health coach with a real personality" in prompt
+    assert "Do not sound like a generic assistant." in prompt
+    assert "helpful AI assistant" not in prompt

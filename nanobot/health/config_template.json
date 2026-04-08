@@ -4,6 +4,7 @@
       "workspace": "/data/workspace",
       "provider": "minimax",
       "model": "MiniMax-M2.7",
+      "temperature": 0.55,
       "timezone": "UTC",
       "maxToolIterations": 8,
       "dream": {
@@ -37,4 +38,3 @@
     "restrictToWorkspace": true
   }
 }
-

@@ -8,6 +8,7 @@ from typing import Any
 
 from nanobot.agent.memory import MemoryStore
 from nanobot.agent.skills import SkillsLoader
+from nanobot.health.storage import is_health_workspace
 from nanobot.utils.helpers import build_assistant_message, current_time_str, detect_image_mime
 from nanobot.utils.prompt_templates import render_template
 
@@ -53,22 +54,35 @@ class ContextBuilder:
         workspace_path = str(self.workspace.expanduser().resolve())
         system = platform.system()
         runtime = f"{'macOS' if system == 'Darwin' else system} {platform.machine()}, Python {platform.python_version()}"
+        assistant_identity = (
+            "NanoHealth, a sharp health coach with a real personality."
+            if is_health_workspace(self.workspace)
+            else "nanobot, a helpful AI assistant."
+        )
 
         return render_template(
             "agent/identity.md",
             workspace_path=workspace_path,
             runtime=runtime,
+            assistant_identity=assistant_identity,
             platform_policy=render_template("agent/platform_policy.md", system=system),
         )
 
     @staticmethod
     def _build_runtime_context(
-        channel: str | None, chat_id: str | None, timezone: str | None = None,
+        channel: str | None,
+        chat_id: str | None,
+        timezone: str | None = None,
+        extra_context: dict[str, str] | None = None,
     ) -> str:
         """Build untrusted runtime metadata block for injection before the user message."""
         lines = [f"Current Time: {current_time_str(timezone)}"]
         if channel and chat_id:
             lines += [f"Channel: {channel}", f"Chat ID: {chat_id}"]
+        if extra_context:
+            for label, value in extra_context.items():
+                if value:
+                    lines.append(f"{label}: {value}")
         return ContextBuilder._RUNTIME_CONTEXT_TAG + "\n" + "\n".join(lines)
 
     @staticmethod
@@ -107,9 +121,15 @@ class ContextBuilder:
         chat_id: str | None = None,
         current_role: str = "user",
         system_prompt: str | None = None,
+        runtime_context_extra: dict[str, str] | None = None,
     ) -> list[dict[str, Any]]:
         """Build the complete message list for an LLM call."""
-        runtime_ctx = self._build_runtime_context(channel, chat_id, self.timezone)
+        runtime_ctx = self._build_runtime_context(
+            channel,
+            chat_id,
+            self.timezone,
+            runtime_context_extra,
+        )
         user_content = self._build_user_content(current_message, media)
 
         # Merge runtime context and user content into a single user message

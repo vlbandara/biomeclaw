@@ -17,9 +17,38 @@ x-common-config: &common-config
     - seccomp=unconfined
 
 services:
+  redis:
+    image: redis:7-alpine
+    container_name: nanobot-redis
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: nanobot-postgres
+    environment:
+      POSTGRES_DB: nanohealth
+      POSTGRES_USER: nanohealth
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-nanohealth}
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   orchestrator:
     <<: *common-config
     container_name: nanohealth-orchestrator
+    depends_on:
+      - postgres
+      - redis
     user: "0:0"
     cap_add:
       - SYS_ADMIN
@@ -35,6 +64,8 @@ services:
       HEALTH_ONBOARDING_BASE_URL: ${HEALTH_ONBOARDING_BASE_URL:-}
       NANOBOT_WORKSPACE: /home/nanobot/.nanobot/workspace
       NANOBOT_HEALTH_INSTANCE_IMAGE: ${NANOBOT_HEALTH_INSTANCE_IMAGE:-nanobot-orchestrator:latest}
+      NANOBOT_HEALTH_REGISTRY_URL: ${NANOBOT_HEALTH_REGISTRY_URL:-postgresql://nanohealth:${POSTGRES_PASSWORD:-nanohealth}@postgres:5432/nanohealth}
+      ARQ_REDIS_URL: ${ARQ_REDIS_URL:-redis://redis:6379/0}
     ports:
       - "8080:8080"
     restart: unless-stopped
@@ -70,6 +101,32 @@ services:
         max-size: "10m"
         max-file: "3"
 
+  worker:
+    <<: *common-config
+    container_name: nanohealth-worker
+    depends_on:
+      - postgres
+      - redis
+    entrypoint: ["python", "-m", "nanobot.health.worker"]
+    volumes:
+      - ~/.nanobot:/home/nanobot/.nanobot
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      MINIMAX_API_KEY: ${MINIMAX_API_KEY:-}
+      HEALTH_VAULT_KEY: ${HEALTH_VAULT_KEY:-}
+      HEALTH_ONBOARDING_BASE_URL: ${HEALTH_ONBOARDING_BASE_URL:-}
+      NANOBOT_WORKSPACE: /home/nanobot/.nanobot/workspace
+      NANOBOT_HEALTH_INSTANCE_IMAGE: ${NANOBOT_HEALTH_INSTANCE_IMAGE:-nanobot-orchestrator:latest}
+      NANOBOT_HEALTH_REGISTRY_URL: ${NANOBOT_HEALTH_REGISTRY_URL:-postgresql://nanohealth:${POSTGRES_PASSWORD:-nanohealth}@postgres:5432/nanohealth}
+      ARQ_REDIS_URL: ${ARQ_REDIS_URL:-redis://redis:6379/0}
+    restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
 volumes:
   caddy_data:
   caddy_config:
+  pg_data:

@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 from typing import Any
 
+from nanobot.health.storage import derive_preferred_name
 from nanobot.utils.helpers import ensure_dir
 from nanobot.utils.prompt_templates import render_template
 
@@ -72,6 +73,7 @@ def write_health_workspace_assets(workspace: Path, profile: dict[str, Any]) -> N
     preferences = profile.get("preferences", {})
 
     files: dict[Path, str] = {
+        workspace / "AGENTS.md": render_template("health/AGENTS.md"),
         workspace / "SOUL.md": render_template("health/SOUL.md"),
         workspace / "USER.md": render_template(
             "health/USER.md",
@@ -198,8 +200,10 @@ def build_vault_payload(
     """Build the encrypted vault payload with raw identifiers."""
     invite = invite or {}
     phase1 = submission["phase1"]
+    full_name = phase1["full_name"]
+    preferred_name = derive_preferred_name(full_name)
     identifiers = {
-        "person_names": _clean_list([phase1["full_name"]]),
+        "person_names": _clean_list([full_name, preferred_name]),
         "emails": _clean_list([phase1.get("email", "")]),
         "phones": _clean_list([phase1.get("phone", "")]),
         "chat_ids": _clean_list([invite.get("chat_id", "")]),
@@ -208,7 +212,8 @@ def build_vault_payload(
     return {
         "identifiers": identifiers,
         "contact": {
-            "full_name": phase1["full_name"],
+            "full_name": full_name,
+            "preferred_name": preferred_name,
             "email": phase1.get("email", "").strip(),
             "phone": phase1.get("phone", "").strip(),
             "invite_channel": invite.get("channel"),
